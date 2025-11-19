@@ -165,6 +165,15 @@ class MemberRoleUpdate(BaseModel):
     member_id: str
     role: str  # admin, treasurer, secretary, member
 
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    profile_picture: Optional[str] = None  # base64
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+
 # Authentication Endpoints
 @api_router.post("/auth/register")
 async def register(user: UserRegister):
@@ -250,6 +259,58 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         "email": current_user.get("email", ""),
         "profile_picture": current_user.get("profile_picture", "")
     }
+
+@api_router.put("/auth/update-profile")
+async def update_profile(data: ProfileUpdate, current_user: dict = Depends(get_current_user)):
+    update_data = {}
+
+    if data.name:
+        update_data["name"] = data.name
+    if data.email:
+        update_data["email"] = data.email
+    if data.profile_picture:
+        update_data["profile_picture"] = data.profile_picture
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No data to update")
+
+    await db.users.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": update_data}
+    )
+
+    # Get updated user
+    updated_user = await db.users.find_one({"_id": current_user["_id"]})
+
+    return {
+        "message": "Profile updated successfully",
+        "user": {
+            "id": str(updated_user["_id"]),
+            "name": updated_user["name"],
+            "phone": updated_user["phone"],
+            "email": updated_user.get("email", ""),
+            "profile_picture": updated_user.get("profile_picture", "")
+        }
+    }
+
+@api_router.put("/auth/change-password")
+async def change_password(data: PasswordChange, current_user: dict = Depends(get_current_user)):
+    # Verify current password
+    if not verify_password(data.current_password, current_user["password_hash"]):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    # Validate new password
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
+
+    # Update password
+    new_password_hash = hash_password(data.new_password)
+    await db.users.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {"password_hash": new_password_hash}}
+    )
+
+    return {"message": "Password changed successfully"}
 
 # Chama Endpoints
 @api_router.post("/chamas/create")
