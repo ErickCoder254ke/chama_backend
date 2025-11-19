@@ -130,6 +130,17 @@ class ContributionUpdate(BaseModel):
     status: str  # paid/pending
     paid_date: Optional[str] = None
 
+class ContributionPayment(BaseModel):
+    payment_method: str  # mpesa, bank_transfer, cash
+    transaction_reference: Optional[str] = None
+    receipt_image: Optional[str] = None  # base64
+    notes: Optional[str] = None
+
+class PaymentVerification(BaseModel):
+    contribution_id: str
+    verified: bool
+    admin_notes: Optional[str] = None
+
 class LoanRequest(BaseModel):
     chama_id: str
     amount: float
@@ -531,7 +542,7 @@ async def update_contribution(contribution_id: str, data: ContributionUpdate, cu
     contribution = await db.contributions.find_one({"_id": ObjectId(contribution_id)})
     if not contribution:
         raise HTTPException(status_code=404, detail="Contribution not found")
-    
+
     # Verify admin
     member = await db.members.find_one({
         "chama_id": contribution["chama_id"],
@@ -540,17 +551,211 @@ async def update_contribution(contribution_id: str, data: ContributionUpdate, cu
     })
     if not member or member["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admins can update contributions")
-    
+
     update_data = {"status": data.status}
     if data.paid_date:
         update_data["paid_date"] = data.paid_date
-    
+
     await db.contributions.update_one(
         {"_id": ObjectId(contribution_id)},
         {"$set": update_data}
     )
-    
+
     return {"message": "Contribution updated successfully"}
+
+@api_router.post("/contributions/{contribution_id}/pay")
+async def make_payment(contribution_id: str, data: ContributionPayment, current_user: dict = Depends(get_current_user)):
+    contribution = await db.contributions.find_one({"_id": ObjectId(contribution_id)})
+    if not contribution:
+        raise HTTPException(status_code=404, detail="Contribution not found")
+
+    # Verify this is the member's own contribution
+    member = await db.members.find_one({
+        "_id": ObjectId(contribution["member_id"]),
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="You can only pay your own contributions")
+
+    # Create payment record
+    payment_dict = {
+        "contribution_id": contribution_id,
+        "chama_id": contribution["chama_id"],
+        "member_id": contribution["member_id"],
+        "user_id": str(current_user["_id"]),
+        "amount": contribution["amount"],
+        "payment_method": data.payment_method,
+        "transaction_reference": data.transaction_reference,
+        "receipt_image": data.receipt_image,
+        "notes": data.notes,
+        "status": "pending_verification",
+        "verified": False,
+        "verified_by": None,
+        "admin_notes": None,
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.payments.insert_one(payment_dict)
+
+    # Update contribution status to pending_verification
+    await db.contributions.update_one(
+        {"_id": ObjectId(contribution_id)},
+        {"$set": {
+            "status": "pending_verification",
+            "payment_id": str(result.inserted_id),
+            "payment_date": datetime.utcnow().isoformat()
+        }}
+    )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": contribution["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "make_payment",
+        "details": f"Payment submitted for {data.payment_method}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "payment_id": str(result.inserted_id),
+        "message": "Payment submitted successfully. Awaiting admin verification."
+    }
+
+@api_router.get("/contributions/my-contributions/{chama_id}")
+async def get_my_contributions(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership and get member record
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get contributions for this member
+    contributions = await db.contributions.find({
+        "chama_id": chama_id,
+        "member_id": str(member["_id"])
+    }).to_list(1000)
+
+    result = []
+    for c in contributions:
+        contribution_data = {
+            "id": str(c["_id"]),
+            "amount": c["amount"],
+            "due_date": c["due_date"],
+            "status": c["status"],
+            "paid_date": c.get("paid_date"),
+            "payment_method": None,
+            "transaction_reference": None,
+            "receipt_image": None
+        }
+
+        # Get payment details if exists
+        if c.get("payment_id"):
+            payment = await db.payments.find_one({"_id": ObjectId(c["payment_id"])})
+            if payment:
+                contribution_data.update({
+                    "payment_method": payment.get("payment_method"),
+                    "transaction_reference": payment.get("transaction_reference"),
+                    "receipt_image": payment.get("receipt_image"),
+                    "verified": payment.get("verified", False),
+                    "admin_notes": payment.get("admin_notes")
+                })
+
+        result.append(contribution_data)
+
+    return result
+
+@api_router.post("/contributions/verify-payment")
+async def verify_payment(data: PaymentVerification, current_user: dict = Depends(get_current_user)):
+    contribution = await db.contributions.find_one({"_id": ObjectId(data.contribution_id)})
+    if not contribution:
+        raise HTTPException(status_code=404, detail="Contribution not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": contribution["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can verify payments")
+
+    # Update payment record
+    if contribution.get("payment_id"):
+        await db.payments.update_one(
+            {"_id": ObjectId(contribution["payment_id"])},
+            {"$set": {
+                "verified": data.verified,
+                "verified_by": str(current_user["_id"]),
+                "admin_notes": data.admin_notes,
+                "verified_at": datetime.utcnow().isoformat()
+            }}
+        )
+
+    # Update contribution status
+    new_status = "paid" if data.verified else "pending"
+    update_data = {"status": new_status}
+    if data.verified:
+        update_data["paid_date"] = datetime.utcnow().isoformat()
+
+    await db.contributions.update_one(
+        {"_id": ObjectId(data.contribution_id)},
+        {"$set": update_data}
+    )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": contribution["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "verify_payment",
+        "details": f"Payment {'verified' if data.verified else 'rejected'}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"message": f"Payment {'verified' if data.verified else 'rejected'} successfully"}
+
+@api_router.get("/payments/pending/{chama_id}")
+async def get_pending_payments(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view pending payments")
+
+    # Get pending payments
+    payments = await db.payments.find({
+        "chama_id": chama_id,
+        "status": "pending_verification"
+    }).to_list(1000)
+
+    result = []
+    for p in payments:
+        # Get member details
+        member_doc = await db.members.find_one({"_id": ObjectId(p["member_id"])})
+        member_name = "Unknown"
+        if member_doc:
+            user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        result.append({
+            "id": str(p["_id"]),
+            "contribution_id": p["contribution_id"],
+            "member_name": member_name,
+            "amount": p["amount"],
+            "payment_method": p["payment_method"],
+            "transaction_reference": p.get("transaction_reference"),
+            "receipt_image": p.get("receipt_image"),
+            "notes": p.get("notes"),
+            "created_at": p["created_at"]
+        })
+
+    return result
 
 # Loan Endpoints
 @api_router.post("/loans/request")
