@@ -644,6 +644,101 @@ async def update_contribution(contribution_id: str, data: ContributionUpdate, cu
 
     return {"message": "Contribution updated successfully"}
 
+@api_router.delete("/contributions/{contribution_id}")
+async def delete_contribution(contribution_id: str, current_user: dict = Depends(get_current_user)):
+    contribution = await db.contributions.find_one({"_id": ObjectId(contribution_id)})
+    if not contribution:
+        raise HTTPException(status_code=404, detail="Contribution not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": contribution["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can delete contributions")
+
+    # Check if this contribution has been consolidated into arrears
+    if contribution.get("consolidated_into_arrears"):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete contribution that has been consolidated into arrears. Delete the arrears contribution instead."
+        )
+
+    # Check if this is an arrears contribution with breakdown
+    if contribution.get("is_arrears") and contribution.get("arrears_breakdown"):
+        # If this is an arrears contribution, we need to un-consolidate the source contributions
+        arrears_breakdown = contribution.get("arrears_breakdown", {})
+        unpaid_periods = arrears_breakdown.get("unpaid_periods", [])
+
+        if unpaid_periods:
+            # Get the IDs of consolidated contributions
+            consolidated_ids = [ObjectId(period["contribution_id"]) for period in unpaid_periods]
+
+            # Un-mark them as consolidated
+            if consolidated_ids:
+                await db.contributions.update_many(
+                    {"_id": {"$in": consolidated_ids}},
+                    {"$unset": {
+                        "consolidated_into_arrears": "",
+                        "consolidated_date": "",
+                        "arrears_contribution_due_date": ""
+                    }}
+                )
+                logger.info(f"Un-consolidated {len(consolidated_ids)} contributions when deleting arrears contribution {contribution_id}")
+
+    # Get member details for logging
+    member_doc = await db.members.find_one({"_id": ObjectId(contribution["member_id"])})
+    member_name = "Unknown"
+    if member_doc:
+        user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+        member_name = user["name"] if user else "Unknown"
+
+    # Delete associated payment records if any
+    if contribution.get("payment_id"):
+        payment_result = await db.payments.delete_one({"_id": ObjectId(contribution["payment_id"])})
+        if payment_result.deleted_count > 0:
+            logger.info(f"Deleted payment record {contribution['payment_id']} associated with contribution {contribution_id}")
+
+    # Store contribution details for audit log before deletion
+    contribution_amount = contribution["amount"]
+    contribution_status = contribution["status"]
+    contribution_due_date = contribution.get("due_date", "N/A")
+
+    # Delete the contribution
+    await db.contributions.delete_one({"_id": ObjectId(contribution_id)})
+
+    # Create audit log
+    await db.audit_logs.insert_one({
+        "chama_id": contribution["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "delete_contribution",
+        "details": f"Deleted {contribution_status} contribution for {member_name}: KES {contribution_amount} (due: {contribution_due_date})",
+        "timestamp": datetime.utcnow().isoformat(),
+        "metadata": {
+            "contribution_id": contribution_id,
+            "member_id": contribution["member_id"],
+            "member_name": member_name,
+            "amount": contribution_amount,
+            "status": contribution_status,
+            "due_date": contribution_due_date,
+            "was_arrears": contribution.get("is_arrears", False)
+        }
+    })
+
+    logger.info(f"Admin {current_user['name']} deleted {contribution_status} contribution {contribution_id} for {member_name} (KES {contribution_amount})")
+
+    return {
+        "message": "Contribution deleted successfully",
+        "details": {
+            "member_name": member_name,
+            "amount": contribution_amount,
+            "status": contribution_status,
+            "due_date": contribution_due_date
+        }
+    }
+
 @api_router.post("/contributions/{contribution_id}/pay")
 async def make_payment(contribution_id: str, data: ContributionPayment, current_user: dict = Depends(get_current_user)):
     contribution = await db.contributions.find_one({"_id": ObjectId(contribution_id)})
