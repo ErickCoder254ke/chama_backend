@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -22,6 +22,8 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 import base64
+import asyncio
+import calendar
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -173,6 +175,23 @@ class ProfileUpdate(BaseModel):
 class PasswordChange(BaseModel):
     current_password: str
     new_password: str
+
+class HistoricalContribution(BaseModel):
+    due_date: str
+    amount: float
+    paid_date: Optional[str] = None
+    status: str  # paid/pending
+    notes: Optional[str] = None
+
+class BulkHistoricalContributions(BaseModel):
+    member_id: str
+    contributions: List[HistoricalContribution]
+
+class AutoContributionSettings(BaseModel):
+    enabled: bool
+    contribution_day: int  # day of month (1-31)
+    contribution_amount: float
+    auto_create_contributions: bool
 
 # Authentication Endpoints
 @api_router.post("/auth/register")
@@ -746,13 +765,15 @@ async def verify_payment(data: PaymentVerification, current_user: dict = Depends
 
     # Update payment record
     if contribution.get("payment_id"):
+        payment_status = "verified" if data.verified else "rejected"
         await db.payments.update_one(
             {"_id": ObjectId(contribution["payment_id"])},
             {"$set": {
                 "verified": data.verified,
                 "verified_by": str(current_user["_id"]),
                 "admin_notes": data.admin_notes,
-                "verified_at": datetime.utcnow().isoformat()
+                "verified_at": datetime.utcnow().isoformat(),
+                "status": payment_status
             }}
         )
 
@@ -817,6 +838,290 @@ async def get_pending_payments(chama_id: str, current_user: dict = Depends(get_c
         })
 
     return result
+
+# Historical Contributions & Auto-Contribution Endpoints
+@api_router.post("/contributions/bulk-historical/{chama_id}")
+async def add_bulk_historical_contributions(
+    chama_id: str,
+    data: BulkHistoricalContributions,
+    current_user: dict = Depends(get_current_user)
+):
+    # Verify admin
+    admin_member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not admin_member or admin_member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can add historical contributions")
+
+    # Verify target member exists
+    target_member = await db.members.find_one({
+        "_id": ObjectId(data.member_id),
+        "chama_id": chama_id,
+        "status": "active"
+    })
+    if not target_member:
+        raise HTTPException(status_code=404, detail="Member not found in this Chama")
+
+    # Get user details for logging
+    user = await db.users.find_one({"_id": ObjectId(target_member["user_id"])})
+    member_name = user["name"] if user else "Unknown"
+
+    # Validate contributions
+    if not data.contributions or len(data.contributions) == 0:
+        raise HTTPException(status_code=400, detail="At least one contribution is required")
+
+    # Insert contributions in bulk
+    contributions_to_insert = []
+    for contrib in data.contributions:
+        contribution_dict = {
+            "chama_id": chama_id,
+            "member_id": data.member_id,
+            "amount": contrib.amount,
+            "due_date": contrib.due_date,
+            "status": contrib.status,
+            "paid_date": contrib.paid_date,
+            "notes": contrib.notes,
+            "is_historical": True,
+            "added_by": str(current_user["_id"]),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        contributions_to_insert.append(contribution_dict)
+
+    if contributions_to_insert:
+        result = await db.contributions.insert_many(contributions_to_insert)
+        inserted_count = len(result.inserted_ids)
+
+        # Audit log
+        await db.audit_logs.insert_one({
+            "chama_id": chama_id,
+            "user_id": str(current_user["_id"]),
+            "action": "add_historical_contributions",
+            "details": f"Added {inserted_count} historical contributions for {member_name}",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+
+        return {
+            "message": f"Successfully added {inserted_count} historical contributions",
+            "count": inserted_count,
+            "contribution_ids": [str(id) for id in result.inserted_ids]
+        }
+
+    return {"message": "No contributions to add", "count": 0}
+
+@api_router.get("/contributions/historical/{chama_id}/{member_id}")
+async def get_historical_contributions(
+    chama_id: str,
+    member_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get historical contributions
+    historical_contribs = await db.contributions.find({
+        "chama_id": chama_id,
+        "member_id": member_id,
+        "is_historical": True
+    }).sort("due_date", 1).to_list(1000)
+
+    result = []
+    for c in historical_contribs:
+        result.append({
+            "id": str(c["_id"]),
+            "amount": c["amount"],
+            "due_date": c["due_date"],
+            "paid_date": c.get("paid_date"),
+            "status": c["status"],
+            "notes": c.get("notes"),
+            "created_at": c["created_at"]
+        })
+
+    return result
+
+@api_router.get("/chamas/{chama_id}/auto-contribution-settings")
+async def get_auto_contribution_settings(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view auto-contribution settings")
+
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    if not chama:
+        raise HTTPException(status_code=404, detail="Chama not found")
+
+    # Return current settings or defaults
+    return {
+        "enabled": chama.get("auto_contribution_enabled", False),
+        "contribution_day": chama.get("contribution_deadline", 1),
+        "contribution_amount": chama.get("contribution_amount", 0),
+        "auto_create_contributions": chama.get("auto_create_contributions", True)
+    }
+
+@api_router.put("/chamas/{chama_id}/auto-contribution-settings")
+async def update_auto_contribution_settings(
+    chama_id: str,
+    settings: AutoContributionSettings,
+    current_user: dict = Depends(get_current_user)
+):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can update auto-contribution settings")
+
+    # Validate contribution day
+    if settings.contribution_day < 1 or settings.contribution_day > 31:
+        raise HTTPException(status_code=400, detail="Contribution day must be between 1 and 31")
+
+    # Validate amount
+    if settings.contribution_amount < 0:
+        raise HTTPException(status_code=400, detail="Contribution amount must be positive")
+
+    # Update chama settings
+    await db.chamas.update_one(
+        {"_id": ObjectId(chama_id)},
+        {"$set": {
+            "auto_contribution_enabled": settings.enabled,
+            "contribution_deadline": settings.contribution_day,
+            "contribution_amount": settings.contribution_amount,
+            "auto_create_contributions": settings.auto_create_contributions,
+            "last_auto_contribution_run": chama.get("last_auto_contribution_run")
+        }}
+    )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "update_auto_contribution_settings",
+        "details": f"Auto-contributions {'enabled' if settings.enabled else 'disabled'}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "message": "Auto-contribution settings updated successfully",
+        "settings": {
+            "enabled": settings.enabled,
+            "contribution_day": settings.contribution_day,
+            "contribution_amount": settings.contribution_amount
+        }
+    }
+
+@api_router.post("/contributions/generate-monthly/{chama_id}")
+async def generate_monthly_contributions(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can generate monthly contributions")
+
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    if not chama:
+        raise HTTPException(status_code=404, detail="Chama not found")
+
+    # Check if auto-contribution is enabled
+    if not chama.get("auto_contribution_enabled", False):
+        raise HTTPException(status_code=400, detail="Auto-contribution is not enabled for this Chama")
+
+    contribution_amount = chama.get("contribution_amount", 0)
+    contribution_day = chama.get("contribution_deadline", 1)
+
+    if contribution_amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid contribution amount")
+
+    # Get all active members
+    members = await db.members.find({
+        "chama_id": chama_id,
+        "status": "active"
+    }).to_list(1000)
+
+    # Calculate next month's due date
+    today = datetime.utcnow()
+    next_month = today.month + 1 if today.month < 12 else 1
+    next_year = today.year if today.month < 12 else today.year + 1
+
+    # Ensure the day is valid for the month
+    import calendar
+    max_day = calendar.monthrange(next_year, next_month)[1]
+    safe_day = min(contribution_day, max_day)
+
+    due_date = datetime(next_year, next_month, safe_day).isoformat().split('T')[0]
+
+    # Check if contributions already exist for this period
+    existing_contributions = await db.contributions.find({
+        "chama_id": chama_id,
+        "due_date": due_date,
+        "is_historical": {"$ne": True}
+    }).to_list(10)
+
+    if existing_contributions and len(existing_contributions) > 0:
+        return {
+            "message": "Contributions for this period already exist",
+            "count": 0,
+            "due_date": due_date
+        }
+
+    # Create contributions for all members
+    contributions_to_insert = []
+    for m in members:
+        contribution_dict = {
+            "chama_id": chama_id,
+            "member_id": str(m["_id"]),
+            "amount": contribution_amount,
+            "due_date": due_date,
+            "status": "pending",
+            "paid_date": None,
+            "is_historical": False,
+            "auto_generated": True,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        contributions_to_insert.append(contribution_dict)
+
+    if contributions_to_insert:
+        result = await db.contributions.insert_many(contributions_to_insert)
+        inserted_count = len(result.inserted_ids)
+
+        # Update last run timestamp
+        await db.chamas.update_one(
+            {"_id": ObjectId(chama_id)},
+            {"$set": {"last_auto_contribution_run": datetime.utcnow().isoformat()}}
+        )
+
+        # Audit log
+        await db.audit_logs.insert_one({
+            "chama_id": chama_id,
+            "user_id": str(current_user["_id"]),
+            "action": "generate_monthly_contributions",
+            "details": f"Generated {inserted_count} contributions for {due_date}",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+
+        return {
+            "message": f"Successfully generated {inserted_count} monthly contributions",
+            "count": inserted_count,
+            "due_date": due_date,
+            "amount": contribution_amount
+        }
+
+    return {"message": "No contributions to generate", "count": 0}
 
 # Loan Endpoints
 @api_router.post("/loans/request")
@@ -1065,6 +1370,225 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Auto-Contribution Scheduler
+async def auto_generate_contributions_task():
+    """Background task that runs periodically to auto-generate monthly contributions"""
+    while True:
+        try:
+            logger.info("Running auto-contribution generation task...")
+
+            # Get all chamas with auto-contribution enabled
+            chamas = await db.chamas.find({
+                "auto_contribution_enabled": True,
+                "auto_create_contributions": True
+            }).to_list(1000)
+
+            logger.info(f"Found {len(chamas)} chamas with auto-contribution enabled")
+
+            for chama in chamas:
+                try:
+                    chama_id = str(chama["_id"])
+                    contribution_amount = chama.get("contribution_amount", 0)
+                    contribution_day = chama.get("contribution_deadline", 1)
+
+                    if contribution_amount <= 0:
+                        logger.warning(f"Skipping chama {chama_id}: Invalid contribution amount")
+                        continue
+
+                    # Check if we should generate contributions for this chama
+                    today = datetime.utcnow()
+                    current_day = today.day
+
+                    # Generate contributions on the specified day of the month
+                    if current_day == contribution_day:
+                        # Check last run to avoid duplicate generation
+                        last_run = chama.get("last_auto_contribution_run")
+                        if last_run:
+                            last_run_date = datetime.fromisoformat(last_run)
+                            # Only run once per month
+                            if last_run_date.month == today.month and last_run_date.year == today.year:
+                                logger.info(f"Skipping chama {chama_id}: Already generated for this month")
+                                continue
+
+                        # Calculate next month's due date
+                        next_month = today.month + 1 if today.month < 12 else 1
+                        next_year = today.year if today.month < 12 else today.year + 1
+
+                        # Ensure the day is valid for the month
+                        max_day = calendar.monthrange(next_year, next_month)[1]
+                        safe_day = min(contribution_day, max_day)
+
+                        due_date = datetime(next_year, next_month, safe_day).isoformat().split('T')[0]
+
+                        # Check if contributions already exist for this period
+                        existing = await db.contributions.find_one({
+                            "chama_id": chama_id,
+                            "due_date": due_date,
+                            "is_historical": {"$ne": True}
+                        })
+
+                        if existing:
+                            logger.info(f"Skipping chama {chama_id}: Contributions already exist for {due_date}")
+                            continue
+
+                        # Get all active members
+                        members = await db.members.find({
+                            "chama_id": chama_id,
+                            "status": "active"
+                        }).to_list(1000)
+
+                        # Create contributions for all members
+                        contributions_to_insert = []
+                        for m in members:
+                            contribution_dict = {
+                                "chama_id": chama_id,
+                                "member_id": str(m["_id"]),
+                                "amount": contribution_amount,
+                                "due_date": due_date,
+                                "status": "pending",
+                                "paid_date": None,
+                                "is_historical": False,
+                                "auto_generated": True,
+                                "created_at": datetime.utcnow().isoformat()
+                            }
+                            contributions_to_insert.append(contribution_dict)
+
+                        if contributions_to_insert:
+                            result = await db.contributions.insert_many(contributions_to_insert)
+                            inserted_count = len(result.inserted_ids)
+
+                            # Update last run timestamp
+                            await db.chamas.update_one(
+                                {"_id": chama["_id"]},
+                                {"$set": {"last_auto_contribution_run": datetime.utcnow().isoformat()}}
+                            )
+
+                            # Audit log
+                            await db.audit_logs.insert_one({
+                                "chama_id": chama_id,
+                                "user_id": "system",
+                                "action": "auto_generate_contributions",
+                                "details": f"Auto-generated {inserted_count} contributions for {due_date}",
+                                "timestamp": datetime.utcnow().isoformat()
+                            })
+
+                            logger.info(f"Generated {inserted_count} contributions for chama {chama_id} (due: {due_date})")
+
+                except Exception as e:
+                    logger.error(f"Error processing chama {chama.get('_id')}: {str(e)}", exc_info=True)
+                    continue
+
+            logger.info("Auto-contribution generation task completed")
+
+        except Exception as e:
+            logger.error(f"Error in auto-contribution task: {str(e)}", exc_info=True)
+
+        # Run this task once per day (every 24 hours)
+        await asyncio.sleep(86400)  # 24 hours in seconds
+
+# Manual trigger endpoint for testing/admin use
+@api_router.post("/system/trigger-auto-contributions")
+async def trigger_auto_contributions(background_tasks: BackgroundTasks):
+    """Manually trigger the auto-contribution generation (admin/system use)"""
+    background_tasks.add_task(auto_generate_contributions_once)
+    return {
+        "message": "Auto-contribution generation triggered",
+        "status": "running"
+    }
+
+async def auto_generate_contributions_once():
+    """One-time execution of auto-contribution generation"""
+    try:
+        logger.info("Manual trigger: Running auto-contribution generation...")
+
+        chamas = await db.chamas.find({
+            "auto_contribution_enabled": True,
+            "auto_create_contributions": True
+        }).to_list(1000)
+
+        total_generated = 0
+
+        for chama in chamas:
+            try:
+                chama_id = str(chama["_id"])
+                contribution_amount = chama.get("contribution_amount", 0)
+                contribution_day = chama.get("contribution_deadline", 1)
+
+                if contribution_amount <= 0:
+                    continue
+
+                today = datetime.utcnow()
+                next_month = today.month + 1 if today.month < 12 else 1
+                next_year = today.year if today.month < 12 else today.year + 1
+
+                max_day = calendar.monthrange(next_year, next_month)[1]
+                safe_day = min(contribution_day, max_day)
+                due_date = datetime(next_year, next_month, safe_day).isoformat().split('T')[0]
+
+                existing = await db.contributions.find_one({
+                    "chama_id": chama_id,
+                    "due_date": due_date,
+                    "is_historical": {"$ne": True}
+                })
+
+                if existing:
+                    continue
+
+                members = await db.members.find({
+                    "chama_id": chama_id,
+                    "status": "active"
+                }).to_list(1000)
+
+                contributions_to_insert = []
+                for m in members:
+                    contribution_dict = {
+                        "chama_id": chama_id,
+                        "member_id": str(m["_id"]),
+                        "amount": contribution_amount,
+                        "due_date": due_date,
+                        "status": "pending",
+                        "paid_date": None,
+                        "is_historical": False,
+                        "auto_generated": True,
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                    contributions_to_insert.append(contribution_dict)
+
+                if contributions_to_insert:
+                    result = await db.contributions.insert_many(contributions_to_insert)
+                    inserted_count = len(result.inserted_ids)
+                    total_generated += inserted_count
+
+                    await db.chamas.update_one(
+                        {"_id": chama["_id"]},
+                        {"$set": {"last_auto_contribution_run": datetime.utcnow().isoformat()}}
+                    )
+
+                    await db.audit_logs.insert_one({
+                        "chama_id": chama_id,
+                        "user_id": "system",
+                        "action": "auto_generate_contributions",
+                        "details": f"Auto-generated {inserted_count} contributions for {due_date}",
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
+
+            except Exception as e:
+                logger.error(f"Error processing chama: {str(e)}", exc_info=True)
+                continue
+
+        logger.info(f"Manual trigger completed: Generated {total_generated} total contributions")
+
+    except Exception as e:
+        logger.error(f"Error in manual auto-contribution trigger: {str(e)}", exc_info=True)
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on app startup"""
+    logger.info("Starting ChamaKe API...")
+    # Start the auto-contribution scheduler in the background
+    asyncio.create_task(auto_generate_contributions_task())
+    logger.info("Auto-contribution scheduler started")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
