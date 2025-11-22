@@ -192,6 +192,7 @@ class AutoContributionSettings(BaseModel):
     contribution_day: int  # day of month (1-31)
     contribution_amount: float
     auto_create_contributions: bool
+    fine_amount: float = 0.0  # fine for late/unpaid contributions
 
 # Authentication Endpoints
 @api_router.post("/auth/register")
@@ -966,7 +967,8 @@ async def get_auto_contribution_settings(chama_id: str, current_user: dict = Dep
         "enabled": chama.get("auto_contribution_enabled", False),
         "contribution_day": chama.get("contribution_deadline", 1),
         "contribution_amount": chama.get("contribution_amount", 0),
-        "auto_create_contributions": chama.get("auto_create_contributions", True)
+        "auto_create_contributions": chama.get("auto_create_contributions", True),
+        "fine_amount": chama.get("fine_amount", 0.0)
     }
 
 @api_router.put("/chamas/{chama_id}/auto-contribution-settings")
@@ -992,6 +994,10 @@ async def update_auto_contribution_settings(
     if settings.contribution_amount < 0:
         raise HTTPException(status_code=400, detail="Contribution amount must be positive")
 
+    # Validate fine amount
+    if settings.fine_amount < 0:
+        raise HTTPException(status_code=400, detail="Fine amount must be positive")
+
     # Update chama settings
     await db.chamas.update_one(
         {"_id": ObjectId(chama_id)},
@@ -1000,6 +1006,7 @@ async def update_auto_contribution_settings(
             "contribution_deadline": settings.contribution_day,
             "contribution_amount": settings.contribution_amount,
             "auto_create_contributions": settings.auto_create_contributions,
+            "fine_amount": settings.fine_amount,
             "last_auto_contribution_run": chama.get("last_auto_contribution_run")
         }}
     )
@@ -1079,20 +1086,86 @@ async def generate_monthly_contributions(chama_id: str, current_user: dict = Dep
             "due_date": due_date
         }
 
-    # Create contributions for all members
+    # Get fine amount
+    fine_amount = chama.get("fine_amount", 0.0)
+
+    # Create contributions for all members with arrears tracking
     contributions_to_insert = []
+    arrears_created = 0
+
     for m in members:
-        contribution_dict = {
+        member_id = str(m["_id"])
+
+        # Check for unpaid contributions for this member (exclude consolidated)
+        unpaid_contributions = await db.contributions.find({
             "chama_id": chama_id,
-            "member_id": str(m["_id"]),
-            "amount": contribution_amount,
-            "due_date": due_date,
-            "status": "pending",
-            "paid_date": None,
-            "is_historical": False,
-            "auto_generated": True,
-            "created_at": datetime.utcnow().isoformat()
-        }
+            "member_id": member_id,
+            "status": {"$in": ["pending", "pending_verification"]},
+            "due_date": {"$lt": due_date},  # Only past contributions
+            "consolidated_into_arrears": {"$ne": True}  # Exclude already consolidated
+        }).to_list(1000)
+
+        if unpaid_contributions and len(unpaid_contributions) > 0:
+            # Member has unpaid contributions - create arrears record
+            total_unpaid = sum(c["amount"] for c in unpaid_contributions)
+
+            # Build arrears breakdown
+            arrears_breakdown = {
+                "previous_unpaid": total_unpaid,
+                "current_month_contribution": contribution_amount,
+                "fine": fine_amount,
+                "total_arrears": total_unpaid + contribution_amount + fine_amount,
+                "unpaid_periods": [
+                    {
+                        "contribution_id": str(c["_id"]),
+                        "due_date": c["due_date"],
+                        "amount": c["amount"]
+                    }
+                    for c in unpaid_contributions
+                ]
+            }
+
+            contribution_dict = {
+                "chama_id": chama_id,
+                "member_id": member_id,
+                "amount": total_unpaid + contribution_amount + fine_amount,
+                "due_date": due_date,
+                "status": "pending",
+                "paid_date": None,
+                "is_historical": False,
+                "auto_generated": True,
+                "is_arrears": True,
+                "arrears_breakdown": arrears_breakdown,
+                "created_at": datetime.utcnow().isoformat()
+            }
+            arrears_created += 1
+
+            # Mark old unpaid contributions as consolidated to prevent double-counting
+            unpaid_contribution_ids = [c["_id"] for c in unpaid_contributions]
+            if unpaid_contribution_ids:
+                await db.contributions.update_many(
+                    {"_id": {"$in": unpaid_contribution_ids}},
+                    {"$set": {
+                        "consolidated_into_arrears": True,
+                        "consolidated_date": datetime.utcnow().isoformat(),
+                        "arrears_contribution_due_date": due_date
+                    }}
+                )
+        else:
+            # No unpaid contributions - create normal contribution
+            contribution_dict = {
+                "chama_id": chama_id,
+                "member_id": member_id,
+                "amount": contribution_amount,
+                "due_date": due_date,
+                "status": "pending",
+                "paid_date": None,
+                "is_historical": False,
+                "auto_generated": True,
+                "is_arrears": False,
+                "created_at": datetime.utcnow().isoformat()
+            }
+
         contributions_to_insert.append(contribution_dict)
 
     if contributions_to_insert:
@@ -1110,13 +1183,14 @@ async def generate_monthly_contributions(chama_id: str, current_user: dict = Dep
             "chama_id": chama_id,
             "user_id": str(current_user["_id"]),
             "action": "generate_monthly_contributions",
-            "details": f"Generated {inserted_count} contributions for {due_date}",
+            "details": f"Generated {inserted_count} contributions for {due_date} ({arrears_created} with arrears)",
             "timestamp": datetime.utcnow().isoformat()
         })
 
         return {
             "message": f"Successfully generated {inserted_count} monthly contributions",
             "count": inserted_count,
+            "arrears_count": arrears_created,
             "due_date": due_date,
             "amount": contribution_amount
         }
@@ -1438,20 +1512,86 @@ async def auto_generate_contributions_task():
                             "status": "active"
                         }).to_list(1000)
 
-                        # Create contributions for all members
+                        # Get fine amount
+                        fine_amount = chama.get("fine_amount", 0.0)
+
+                        # Create contributions for all members with arrears tracking
                         contributions_to_insert = []
+                        arrears_created = 0
+
                         for m in members:
-                            contribution_dict = {
+                            member_id = str(m["_id"])
+
+                            # Check for unpaid contributions for this member (exclude consolidated)
+                            unpaid_contributions = await db.contributions.find({
                                 "chama_id": chama_id,
-                                "member_id": str(m["_id"]),
-                                "amount": contribution_amount,
-                                "due_date": due_date,
-                                "status": "pending",
-                                "paid_date": None,
-                                "is_historical": False,
-                                "auto_generated": True,
-                                "created_at": datetime.utcnow().isoformat()
-                            }
+                                "member_id": member_id,
+                                "status": {"$in": ["pending", "pending_verification"]},
+                                "due_date": {"$lt": due_date},  # Only past contributions
+                                "consolidated_into_arrears": {"$ne": True}  # Exclude already consolidated
+                            }).to_list(1000)
+
+                            if unpaid_contributions and len(unpaid_contributions) > 0:
+                                # Member has unpaid contributions - create arrears record
+                                total_unpaid = sum(c["amount"] for c in unpaid_contributions)
+
+                                # Build arrears breakdown
+                                arrears_breakdown = {
+                                    "previous_unpaid": total_unpaid,
+                                    "current_month_contribution": contribution_amount,
+                                    "fine": fine_amount,
+                                    "total_arrears": total_unpaid + contribution_amount + fine_amount,
+                                    "unpaid_periods": [
+                                        {
+                                            "contribution_id": str(c["_id"]),
+                                            "due_date": c["due_date"],
+                                            "amount": c["amount"]
+                                        }
+                                        for c in unpaid_contributions
+                                    ]
+                                }
+
+                                contribution_dict = {
+                                    "chama_id": chama_id,
+                                    "member_id": member_id,
+                                    "amount": total_unpaid + contribution_amount + fine_amount,
+                                    "due_date": due_date,
+                                    "status": "pending",
+                                    "paid_date": None,
+                                    "is_historical": False,
+                                    "auto_generated": True,
+                                    "is_arrears": True,
+                                    "arrears_breakdown": arrears_breakdown,
+                                    "created_at": datetime.utcnow().isoformat()
+                                }
+                                arrears_created += 1
+
+                                # Mark old unpaid contributions as consolidated to prevent double-counting
+                                unpaid_contribution_ids = [c["_id"] for c in unpaid_contributions]
+                                if unpaid_contribution_ids:
+                                    await db.contributions.update_many(
+                                        {"_id": {"$in": unpaid_contribution_ids}},
+                                        {"$set": {
+                                            "consolidated_into_arrears": True,
+                                            "consolidated_date": datetime.utcnow().isoformat(),
+                                            "arrears_contribution_due_date": due_date
+                                        }}
+                                    )
+                            else:
+                                # No unpaid contributions - create normal contribution
+                                contribution_dict = {
+                                    "chama_id": chama_id,
+                                    "member_id": member_id,
+                                    "amount": contribution_amount,
+                                    "due_date": due_date,
+                                    "status": "pending",
+                                    "paid_date": None,
+                                    "is_historical": False,
+                                    "auto_generated": True,
+                                    "is_arrears": False,
+                                    "created_at": datetime.utcnow().isoformat()
+                                }
+
                             contributions_to_insert.append(contribution_dict)
 
                         if contributions_to_insert:
@@ -1469,11 +1609,11 @@ async def auto_generate_contributions_task():
                                 "chama_id": chama_id,
                                 "user_id": "system",
                                 "action": "auto_generate_contributions",
-                                "details": f"Auto-generated {inserted_count} contributions for {due_date}",
+                                "details": f"Auto-generated {inserted_count} contributions for {due_date} ({arrears_created} with arrears)",
                                 "timestamp": datetime.utcnow().isoformat()
                             })
 
-                            logger.info(f"Generated {inserted_count} contributions for chama {chama_id} (due: {due_date})")
+                            logger.info(f"Generated {inserted_count} contributions for chama {chama_id} (due: {due_date}, {arrears_created} with arrears)")
 
                 except Exception as e:
                     logger.error(f"Error processing chama {chama.get('_id')}: {str(e)}", exc_info=True)
@@ -1540,19 +1680,85 @@ async def auto_generate_contributions_once():
                     "status": "active"
                 }).to_list(1000)
 
+                # Get fine amount
+                fine_amount = chama.get("fine_amount", 0.0)
+
                 contributions_to_insert = []
+                arrears_created = 0
+
                 for m in members:
-                    contribution_dict = {
+                    member_id = str(m["_id"])
+
+                    # Check for unpaid contributions for this member (exclude consolidated)
+                    unpaid_contributions = await db.contributions.find({
                         "chama_id": chama_id,
-                        "member_id": str(m["_id"]),
-                        "amount": contribution_amount,
-                        "due_date": due_date,
-                        "status": "pending",
-                        "paid_date": None,
-                        "is_historical": False,
-                        "auto_generated": True,
-                        "created_at": datetime.utcnow().isoformat()
-                    }
+                        "member_id": member_id,
+                        "status": {"$in": ["pending", "pending_verification"]},
+                        "due_date": {"$lt": due_date},  # Only past contributions
+                        "consolidated_into_arrears": {"$ne": True}  # Exclude already consolidated
+                    }).to_list(1000)
+
+                    if unpaid_contributions and len(unpaid_contributions) > 0:
+                        # Member has unpaid contributions - create arrears record
+                        total_unpaid = sum(c["amount"] for c in unpaid_contributions)
+
+                        # Build arrears breakdown
+                        arrears_breakdown = {
+                            "previous_unpaid": total_unpaid,
+                            "current_month_contribution": contribution_amount,
+                            "fine": fine_amount,
+                            "total_arrears": total_unpaid + contribution_amount + fine_amount,
+                            "unpaid_periods": [
+                                {
+                                    "contribution_id": str(c["_id"]),
+                                    "due_date": c["due_date"],
+                                    "amount": c["amount"]
+                                }
+                                for c in unpaid_contributions
+                            ]
+                        }
+
+                        contribution_dict = {
+                            "chama_id": chama_id,
+                            "member_id": member_id,
+                            "amount": total_unpaid + contribution_amount + fine_amount,
+                            "due_date": due_date,
+                            "status": "pending",
+                            "paid_date": None,
+                            "is_historical": False,
+                            "auto_generated": True,
+                            "is_arrears": True,
+                            "arrears_breakdown": arrears_breakdown,
+                            "created_at": datetime.utcnow().isoformat()
+                        }
+                        arrears_created += 1
+
+                        # Mark old unpaid contributions as consolidated to prevent double-counting
+                        unpaid_contribution_ids = [c["_id"] for c in unpaid_contributions]
+                        if unpaid_contribution_ids:
+                            await db.contributions.update_many(
+                                {"_id": {"$in": unpaid_contribution_ids}},
+                                {"$set": {
+                                    "consolidated_into_arrears": True,
+                                    "consolidated_date": datetime.utcnow().isoformat(),
+                                    "arrears_contribution_due_date": due_date
+                                }}
+                            )
+                    else:
+                        # No unpaid contributions - create normal contribution
+                        contribution_dict = {
+                            "chama_id": chama_id,
+                            "member_id": member_id,
+                            "amount": contribution_amount,
+                            "due_date": due_date,
+                            "status": "pending",
+                            "paid_date": None,
+                            "is_historical": False,
+                            "auto_generated": True,
+                            "is_arrears": False,
+                            "created_at": datetime.utcnow().isoformat()
+                        }
+
                     contributions_to_insert.append(contribution_dict)
 
                 if contributions_to_insert:
@@ -1569,7 +1775,7 @@ async def auto_generate_contributions_once():
                         "chama_id": chama_id,
                         "user_id": "system",
                         "action": "auto_generate_contributions",
-                        "details": f"Auto-generated {inserted_count} contributions for {due_date}",
+                        "details": f"Auto-generated {inserted_count} contributions for {due_date} ({arrears_created} with arrears)",
                         "timestamp": datetime.utcnow().isoformat()
                     })
 
