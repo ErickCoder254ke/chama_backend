@@ -194,6 +194,81 @@ class AutoContributionSettings(BaseModel):
     auto_create_contributions: bool
     fine_amount: float = 0.0  # fine for late/unpaid contributions
 
+class MerryGoRoundCreate(BaseModel):
+    chama_id: str
+    name: str
+    contribution_amount: float
+    frequency: str  # weekly, monthly
+    member_order: List[str]  # list of member_ids in rotation order
+    start_date: str
+    funding_source: str  # contribution, balance
+    description: Optional[str] = None
+
+class MerryGoRoundUpdate(BaseModel):
+    status: str  # active, completed, paused
+
+class MerryGoRoundAdvance(BaseModel):
+    round_id: str
+    payout_amount: float
+    payment_method: str  # mpesa, bank_transfer, cash
+    transaction_reference: Optional[str] = None
+    notes: Optional[str] = None
+
+class InvestmentGoalCreate(BaseModel):
+    chama_id: str
+    name: str
+    description: Optional[str] = None
+    target_amount: float
+    deadline: str  # YYYY-MM-DD
+    goal_type: str  # group, personal
+    category: str  # real_estate, business, stocks, bonds, emergency_fund, other
+    icon: Optional[str] = None
+    color: Optional[str] = None
+
+class InvestmentGoalUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    target_amount: Optional[float] = None
+    deadline: Optional[str] = None
+    status: Optional[str] = None  # active, completed, cancelled
+    category: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+
+class GoalContributionCreate(BaseModel):
+    goal_id: str
+    amount: float
+    contribution_date: Optional[str] = None
+    notes: Optional[str] = None
+
+class InvestmentCreate(BaseModel):
+    chama_id: str
+    name: str
+    description: Optional[str] = None
+    investment_type: str  # real_estate, stocks, bonds, business, mutual_fund, treasury_bill, other
+    initial_amount: float
+    current_value: float
+    purchase_date: str
+    maturity_date: Optional[str] = None
+    risk_level: str  # low, medium, high
+    notes: Optional[str] = None
+    linked_goal_id: Optional[str] = None
+
+class InvestmentUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    current_value: Optional[float] = None
+    maturity_date: Optional[str] = None
+    status: Optional[str] = None  # active, matured, sold, liquidated
+    notes: Optional[str] = None
+
+class InvestmentReturnCreate(BaseModel):
+    investment_id: str
+    return_amount: float
+    return_date: str
+    return_type: str  # dividend, interest, capital_gain, sale_proceeds
+    notes: Optional[str] = None
+
 # Authentication Endpoints
 @api_router.post("/auth/register")
 async def register(user: UserRegister):
@@ -1443,9 +1518,13 @@ async def get_dashboard(chama_id: str, current_user: dict = Depends(get_current_
     loan_ids = [str(l["_id"]) for l in loans]
     total_repaid = sum(r["amount"] for r in repayments if r["loan_id"] in loan_ids)
     
+    # Get total merry-go-round disbursements (balance-funded only)
+    mgr_disbursements = await db.merry_go_round_disbursements.find({"chama_id": chama_id}).to_list(10000)
+    total_mgr_disbursements = sum(d["amount"] for d in mgr_disbursements)
+
     outstanding_loans = total_loans_issued - total_repaid
-    current_balance = total_contributions - total_loans_issued + total_repaid
-    
+    current_balance = total_contributions - total_loans_issued + total_repaid - total_mgr_disbursements
+
     member_count = await db.members.count_documents({"chama_id": chama_id, "status": "active"})
     
     return {
@@ -1506,6 +1585,1075 @@ async def get_announcements(chama_id: str, current_user: dict = Depends(get_curr
         })
     
     return result
+
+# Merry-Go-Round Endpoints
+@api_router.post("/merry-go-round/create")
+async def create_merry_go_round(data: MerryGoRoundCreate, current_user: dict = Depends(get_current_user)):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can create merry-go-rounds")
+
+    # Verify all members in order exist and belong to chama
+    for member_id in data.member_order:
+        m = await db.members.find_one({
+            "_id": ObjectId(member_id),
+            "chama_id": data.chama_id,
+            "status": "active"
+        })
+        if not m:
+            raise HTTPException(status_code=400, detail=f"Invalid member in rotation order: {member_id}")
+
+    # Validate funding_source
+    if data.funding_source not in ["contribution", "balance"]:
+        raise HTTPException(status_code=400, detail="Invalid funding_source. Must be 'contribution' or 'balance'")
+
+    # Create merry-go-round
+    mgr_dict = {
+        "chama_id": data.chama_id,
+        "name": data.name,
+        "contribution_amount": data.contribution_amount,
+        "frequency": data.frequency,
+        "member_order": data.member_order,
+        "current_position": 0,
+        "start_date": data.start_date,
+        "funding_source": data.funding_source,
+        "description": data.description,
+        "status": "active",
+        "created_by": str(current_user["_id"]),
+        "created_at": datetime.utcnow().isoformat(),
+        "history": []
+    }
+
+    result = await db.merry_go_rounds.insert_one(mgr_dict)
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "create_merry_go_round",
+        "details": f"Created Merry-Go-Round: {data.name}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"round_id": str(result.inserted_id), "message": "Merry-Go-Round created successfully"}
+
+@api_router.get("/merry-go-round/{chama_id}")
+async def get_merry_go_rounds(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    rounds = await db.merry_go_rounds.find({"chama_id": chama_id}).to_list(100)
+
+    result = []
+    for r in rounds:
+        # Calculate total amount (contribution * number of members)
+        total_amount = r["contribution_amount"] * len(r["member_order"])
+
+        # Get next payout member
+        current_pos = r.get("current_position", 0)
+        next_member_id = None
+        next_member_name = "N/A"
+
+        if current_pos < len(r["member_order"]):
+            next_member_id = r["member_order"][current_pos]
+            next_member_doc = await db.members.find_one({"_id": ObjectId(next_member_id)})
+            if next_member_doc:
+                next_user = await db.users.find_one({"_id": ObjectId(next_member_doc["user_id"])})
+                next_member_name = next_user["name"] if next_user else "Unknown"
+
+        # Find current user's position in rotation
+        user_member_id = str(member["_id"])
+        user_position = -1
+        if user_member_id in r["member_order"]:
+            user_position = r["member_order"].index(user_member_id)
+
+        # Calculate expected payout date based on frequency and position
+        start_date = datetime.fromisoformat(r["start_date"])
+        if r["frequency"] == "weekly":
+            if user_position >= 0:
+                expected_date = start_date + timedelta(weeks=user_position)
+                next_payout_date = start_date + timedelta(weeks=current_pos)
+            else:
+                expected_date = None
+                next_payout_date = start_date + timedelta(weeks=current_pos)
+        else:  # monthly
+            if user_position >= 0:
+                # Add months
+                month = start_date.month + user_position
+                year = start_date.year + (month - 1) // 12
+                month = ((month - 1) % 12) + 1
+                expected_date = datetime(year, month, start_date.day)
+
+                # Next payout date
+                month_next = start_date.month + current_pos
+                year_next = start_date.year + (month_next - 1) // 12
+                month_next = ((month_next - 1) % 12) + 1
+                next_payout_date = datetime(year_next, month_next, start_date.day)
+            else:
+                expected_date = None
+                month_next = start_date.month + current_pos
+                year_next = start_date.year + (month_next - 1) // 12
+                month_next = ((month_next - 1) % 12) + 1
+                next_payout_date = datetime(year_next, month_next, start_date.day)
+
+        result.append({
+            "id": str(r["_id"]),
+            "name": r["name"],
+            "total_amount": total_amount,
+            "contribution_amount": r["contribution_amount"],
+            "current_position": current_pos,
+            "total_members": len(r["member_order"]),
+            "next_payout": {
+                "member": next_member_name,
+                "date": next_payout_date.strftime("%b %d, %Y") if next_payout_date else "N/A",
+                "amount": total_amount
+            },
+            "your_position": user_position + 1 if user_position >= 0 else -1,
+            "your_expected_date": expected_date.strftime("%b %d, %Y") if expected_date else "N/A",
+            "status": r["status"],
+            "frequency": r["frequency"],
+            "start_date": r["start_date"],
+            "funding_source": r.get("funding_source", "contribution")
+        })
+
+    return result
+
+@api_router.get("/merry-go-round/details/{round_id}")
+async def get_merry_go_round_details(round_id: str, current_user: dict = Depends(get_current_user)):
+    mgr = await db.merry_go_rounds.find_one({"_id": ObjectId(round_id)})
+    if not mgr:
+        raise HTTPException(status_code=404, detail="Merry-Go-Round not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": mgr["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    return {
+        "id": str(mgr["_id"]),
+        "name": mgr["name"],
+        "contribution_amount": mgr["contribution_amount"],
+        "frequency": mgr["frequency"],
+        "member_order": mgr["member_order"],
+        "current_position": mgr.get("current_position", 0),
+        "start_date": mgr["start_date"],
+        "funding_source": mgr.get("funding_source", "contribution"),
+        "description": mgr.get("description"),
+        "status": mgr["status"],
+        "created_at": mgr["created_at"]
+    }
+
+@api_router.get("/merry-go-round/schedule/{round_id}")
+async def get_merry_go_round_schedule(round_id: str, current_user: dict = Depends(get_current_user)):
+    mgr = await db.merry_go_rounds.find_one({"_id": ObjectId(round_id)})
+    if not mgr:
+        raise HTTPException(status_code=404, detail="Merry-Go-Round not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": mgr["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Build schedule
+    schedule = []
+    start_date = datetime.fromisoformat(mgr["start_date"])
+
+    for idx, member_id in enumerate(mgr["member_order"]):
+        # Get member details
+        member_doc = await db.members.find_one({"_id": ObjectId(member_id)})
+        member_name = "Unknown"
+        if member_doc:
+            user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        # Calculate payout date
+        if mgr["frequency"] == "weekly":
+            payout_date = start_date + timedelta(weeks=idx)
+        else:  # monthly
+            month = start_date.month + idx
+            year = start_date.year + (month - 1) // 12
+            month = ((month - 1) % 12) + 1
+            payout_date = datetime(year, month, start_date.day)
+
+        # Determine status
+        current_pos = mgr.get("current_position", 0)
+        if idx < current_pos:
+            status = "completed"
+        elif idx == current_pos:
+            status = "current"
+        else:
+            status = "upcoming"
+
+        schedule.append({
+            "position": idx + 1,
+            "member_id": member_id,
+            "member_name": member_name,
+            "payout_date": payout_date.strftime("%Y-%m-%d"),
+            "payout_date_formatted": payout_date.strftime("%b %d, %Y"),
+            "amount": mgr["contribution_amount"] * len(mgr["member_order"]),
+            "status": status
+        })
+
+    return schedule
+
+@api_router.get("/merry-go-round/history/{round_id}")
+async def get_merry_go_round_history(round_id: str, current_user: dict = Depends(get_current_user)):
+    mgr = await db.merry_go_rounds.find_one({"_id": ObjectId(round_id)})
+    if not mgr:
+        raise HTTPException(status_code=404, detail="Merry-Go-Round not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": mgr["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get history with member names
+    history = mgr.get("history", [])
+    result = []
+
+    for h in history:
+        member_doc = await db.members.find_one({"_id": ObjectId(h["member_id"])})
+        member_name = "Unknown"
+        if member_doc:
+            user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        result.append({
+            "member_id": h["member_id"],
+            "member_name": member_name,
+            "position": h["position"],
+            "amount": h["amount"],
+            "payout_date": h["payout_date"],
+            "payment_method": h.get("payment_method"),
+            "transaction_reference": h.get("transaction_reference"),
+            "notes": h.get("notes"),
+            "processed_by": h.get("processed_by"),
+            "processed_at": h.get("processed_at")
+        })
+
+    return result
+
+@api_router.post("/merry-go-round/advance")
+async def advance_merry_go_round(data: MerryGoRoundAdvance, current_user: dict = Depends(get_current_user)):
+    mgr = await db.merry_go_rounds.find_one({"_id": ObjectId(data.round_id)})
+    if not mgr:
+        raise HTTPException(status_code=404, detail="Merry-Go-Round not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": mgr["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can advance merry-go-rounds")
+
+    # Check if already completed
+    if mgr["status"] == "completed":
+        raise HTTPException(status_code=400, detail="Merry-Go-Round is already completed")
+
+    current_pos = mgr.get("current_position", 0)
+    if current_pos >= len(mgr["member_order"]):
+        raise HTTPException(status_code=400, detail="All members have already received payouts")
+
+    # Get current member
+    current_member_id = mgr["member_order"][current_pos]
+
+    # If funding_source is "balance", check if chama has sufficient balance
+    if mgr.get("funding_source") == "balance":
+        # Calculate current balance
+        contributions = await db.contributions.find({"chama_id": mgr["chama_id"]}).to_list(10000)
+        total_contributions = sum(c["amount"] for c in contributions if c["status"] == "paid")
+
+        loans = await db.loans.find({"chama_id": mgr["chama_id"], "status": "approved"}).to_list(10000)
+        total_loans_issued = sum(l["amount"] for l in loans)
+
+        repayments = await db.repayments.find({}).to_list(10000)
+        loan_ids = [str(l["_id"]) for l in loans]
+        total_repaid = sum(r["amount"] for r in repayments if r["loan_id"] in loan_ids)
+
+        # Get total merry-go-round disbursements
+        mgr_disbursements = await db.merry_go_round_disbursements.find({"chama_id": mgr["chama_id"]}).to_list(10000)
+        total_mgr_disbursements = sum(d["amount"] for d in mgr_disbursements)
+
+        current_balance = total_contributions - total_loans_issued + total_repaid - total_mgr_disbursements
+
+        if current_balance < data.payout_amount:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient balance. Current balance: KES {current_balance:.2f}, Required: KES {data.payout_amount:.2f}"
+            )
+
+    # Add to history
+    history_entry = {
+        "member_id": current_member_id,
+        "position": current_pos + 1,
+        "amount": data.payout_amount,
+        "payout_date": datetime.utcnow().isoformat().split('T')[0],
+        "payment_method": data.payment_method,
+        "transaction_reference": data.transaction_reference,
+        "notes": data.notes,
+        "processed_by": str(current_user["_id"]),
+        "processed_at": datetime.utcnow().isoformat()
+    }
+
+    # Update position
+    new_position = current_pos + 1
+    new_status = "completed" if new_position >= len(mgr["member_order"]) else "active"
+
+    await db.merry_go_rounds.update_one(
+        {"_id": ObjectId(data.round_id)},
+        {
+            "$set": {
+                "current_position": new_position,
+                "status": new_status
+            },
+            "$push": {"history": history_entry}
+        }
+    )
+
+    # If funding_source is "balance", record the disbursement
+    if mgr.get("funding_source") == "balance":
+        disbursement_dict = {
+            "chama_id": mgr["chama_id"],
+            "round_id": data.round_id,
+            "round_name": mgr["name"],
+            "member_id": current_member_id,
+            "amount": data.payout_amount,
+            "payment_method": data.payment_method,
+            "transaction_reference": data.transaction_reference,
+            "notes": data.notes,
+            "position": current_pos + 1,
+            "disbursed_by": str(current_user["_id"]),
+            "disbursed_at": datetime.utcnow().isoformat()
+        }
+        await db.merry_go_round_disbursements.insert_one(disbursement_dict)
+
+    # Audit log
+    funding_info = f" (funded from {mgr.get('funding_source', 'contribution')})" if mgr.get("funding_source") else ""
+    await db.audit_logs.insert_one({
+        "chama_id": mgr["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "advance_merry_go_round",
+        "details": f"Advanced {mgr['name']} to position {new_position}{funding_info}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "message": "Merry-Go-Round advanced successfully",
+        "new_position": new_position,
+        "status": new_status,
+        "funding_source": mgr.get("funding_source", "contribution")
+    }
+
+@api_router.put("/merry-go-round/{round_id}")
+async def update_merry_go_round_status(
+    round_id: str,
+    data: MerryGoRoundUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    mgr = await db.merry_go_rounds.find_one({"_id": ObjectId(round_id)})
+    if not mgr:
+        raise HTTPException(status_code=404, detail="Merry-Go-Round not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": mgr["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can update merry-go-rounds")
+
+    await db.merry_go_rounds.update_one(
+        {"_id": ObjectId(round_id)},
+        {"$set": {"status": data.status}}
+    )
+
+    return {"message": "Merry-Go-Round status updated successfully"}
+
+# Investment Goals Endpoints
+@api_router.post("/investment-goals/create")
+async def create_investment_goal(data: InvestmentGoalCreate, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # For group goals, verify admin
+    if data.goal_type == "group":
+        if member["role"] != "admin":
+            raise HTTPException(status_code=403, detail="Only admins can create group goals")
+
+    goal_dict = {
+        "chama_id": data.chama_id,
+        "name": data.name,
+        "description": data.description,
+        "target_amount": data.target_amount,
+        "current_amount": 0.0,
+        "deadline": data.deadline,
+        "goal_type": data.goal_type,  # group or personal
+        "category": data.category,
+        "icon": data.icon or "trophy",
+        "color": data.color or "#4ECDC4",
+        "status": "active",
+        "created_by": str(current_user["_id"]),
+        "member_id": str(member["_id"]) if data.goal_type == "personal" else None,
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.investment_goals.insert_one(goal_dict)
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "create_investment_goal",
+        "details": f"Created {data.goal_type} goal: {data.name}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"goal_id": str(result.inserted_id), "message": "Investment goal created successfully"}
+
+@api_router.get("/investment-goals/{chama_id}")
+async def get_investment_goals(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get all group goals and user's personal goals
+    goals = await db.investment_goals.find({
+        "chama_id": chama_id,
+        "$or": [
+            {"goal_type": "group"},
+            {"member_id": str(member["_id"])}
+        ]
+    }).to_list(1000)
+
+    result = []
+    for goal in goals:
+        # Get contribution count
+        contribution_count = await db.goal_contributions.count_documents({"goal_id": str(goal["_id"])})
+
+        # Calculate progress percentage
+        progress = (goal["current_amount"] / goal["target_amount"] * 100) if goal["target_amount"] > 0 else 0
+
+        result.append({
+            "id": str(goal["_id"]),
+            "name": goal["name"],
+            "description": goal.get("description"),
+            "target_amount": goal["target_amount"],
+            "current_amount": goal["current_amount"],
+            "progress": round(progress, 2),
+            "deadline": goal["deadline"],
+            "goal_type": goal["goal_type"],
+            "category": goal["category"],
+            "icon": goal.get("icon", "trophy"),
+            "color": goal.get("color", "#4ECDC4"),
+            "status": goal["status"],
+            "contribution_count": contribution_count,
+            "created_at": goal["created_at"]
+        })
+
+    return result
+
+@api_router.get("/investment-goals/detail/{goal_id}")
+async def get_investment_goal_details(goal_id: str, current_user: dict = Depends(get_current_user)):
+    goal = await db.investment_goals.find_one({"_id": ObjectId(goal_id)})
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": goal["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Verify access to personal goal
+    if goal["goal_type"] == "personal" and goal["member_id"] != str(member["_id"]):
+        raise HTTPException(status_code=403, detail="You can only view your own personal goals")
+
+    # Get contributions
+    contributions = await db.goal_contributions.find({"goal_id": goal_id}).sort("contribution_date", -1).to_list(100)
+
+    contribution_list = []
+    for contrib in contributions:
+        # Get contributor details
+        contrib_member = await db.members.find_one({"_id": ObjectId(contrib["member_id"])})
+        contributor_name = "Unknown"
+        if contrib_member:
+            user = await db.users.find_one({"_id": ObjectId(contrib_member["user_id"])})
+            contributor_name = user["name"] if user else "Unknown"
+
+        contribution_list.append({
+            "id": str(contrib["_id"]),
+            "amount": contrib["amount"],
+            "contributor_name": contributor_name,
+            "contribution_date": contrib["contribution_date"],
+            "notes": contrib.get("notes")
+        })
+
+    # Calculate progress
+    progress = (goal["current_amount"] / goal["target_amount"] * 100) if goal["target_amount"] > 0 else 0
+
+    return {
+        "id": str(goal["_id"]),
+        "name": goal["name"],
+        "description": goal.get("description"),
+        "target_amount": goal["target_amount"],
+        "current_amount": goal["current_amount"],
+        "progress": round(progress, 2),
+        "deadline": goal["deadline"],
+        "goal_type": goal["goal_type"],
+        "category": goal["category"],
+        "icon": goal.get("icon", "trophy"),
+        "color": goal.get("color", "#4ECDC4"),
+        "status": goal["status"],
+        "contributions": contribution_list,
+        "created_at": goal["created_at"]
+    }
+
+@api_router.put("/investment-goals/{goal_id}")
+async def update_investment_goal(goal_id: str, data: InvestmentGoalUpdate, current_user: dict = Depends(get_current_user)):
+    goal = await db.investment_goals.find_one({"_id": ObjectId(goal_id)})
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": goal["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Verify permission to update
+    if goal["goal_type"] == "group":
+        if member["role"] != "admin":
+            raise HTTPException(status_code=403, detail="Only admins can update group goals")
+    elif goal["member_id"] != str(member["_id"]):
+        raise HTTPException(status_code=403, detail="You can only update your own personal goals")
+
+    update_data = {}
+    if data.name:
+        update_data["name"] = data.name
+    if data.description is not None:
+        update_data["description"] = data.description
+    if data.target_amount:
+        update_data["target_amount"] = data.target_amount
+    if data.deadline:
+        update_data["deadline"] = data.deadline
+    if data.status:
+        update_data["status"] = data.status
+    if data.category:
+        update_data["category"] = data.category
+    if data.icon:
+        update_data["icon"] = data.icon
+    if data.color:
+        update_data["color"] = data.color
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No data to update")
+
+    await db.investment_goals.update_one(
+        {"_id": ObjectId(goal_id)},
+        {"$set": update_data}
+    )
+
+    return {"message": "Goal updated successfully"}
+
+@api_router.delete("/investment-goals/{goal_id}")
+async def delete_investment_goal(goal_id: str, current_user: dict = Depends(get_current_user)):
+    goal = await db.investment_goals.find_one({"_id": ObjectId(goal_id)})
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": goal["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Verify permission to delete
+    if goal["goal_type"] == "group":
+        if member["role"] != "admin":
+            raise HTTPException(status_code=403, detail="Only admins can delete group goals")
+    elif goal["member_id"] != str(member["_id"]):
+        raise HTTPException(status_code=403, detail="You can only delete your own personal goals")
+
+    await db.investment_goals.delete_one({"_id": ObjectId(goal_id)})
+
+    # Delete associated contributions
+    await db.goal_contributions.delete_many({"goal_id": goal_id})
+
+    return {"message": "Goal deleted successfully"}
+
+# Goal Contributions Endpoints
+@api_router.post("/goal-contributions/create")
+async def create_goal_contribution(data: GoalContributionCreate, current_user: dict = Depends(get_current_user)):
+    goal = await db.investment_goals.find_one({"_id": ObjectId(data.goal_id)})
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": goal["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Verify access for personal goals
+    if goal["goal_type"] == "personal" and goal["member_id"] != str(member["_id"]):
+        raise HTTPException(status_code=403, detail="You can only contribute to your own personal goals")
+
+    contribution_date = data.contribution_date or datetime.utcnow().isoformat().split('T')[0]
+
+    contrib_dict = {
+        "goal_id": data.goal_id,
+        "chama_id": goal["chama_id"],
+        "member_id": str(member["_id"]),
+        "amount": data.amount,
+        "contribution_date": contribution_date,
+        "notes": data.notes,
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.goal_contributions.insert_one(contrib_dict)
+
+    # Update goal's current amount
+    await db.investment_goals.update_one(
+        {"_id": ObjectId(data.goal_id)},
+        {"$inc": {"current_amount": data.amount}}
+    )
+
+    # Check if goal is completed
+    updated_goal = await db.investment_goals.find_one({"_id": ObjectId(data.goal_id)})
+    if updated_goal["current_amount"] >= updated_goal["target_amount"]:
+        await db.investment_goals.update_one(
+            {"_id": ObjectId(data.goal_id)},
+            {"$set": {"status": "completed"}}
+        )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": goal["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "contribute_to_goal",
+        "details": f"Contributed KES {data.amount} to goal: {goal['name']}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"contribution_id": str(result.inserted_id), "message": "Contribution added successfully"}
+
+@api_router.get("/goal-contributions/{goal_id}")
+async def get_goal_contributions(goal_id: str, current_user: dict = Depends(get_current_user)):
+    goal = await db.investment_goals.find_one({"_id": ObjectId(goal_id)})
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": goal["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    contributions = await db.goal_contributions.find({"goal_id": goal_id}).sort("contribution_date", -1).to_list(100)
+
+    result = []
+    for contrib in contributions:
+        contrib_member = await db.members.find_one({"_id": ObjectId(contrib["member_id"])})
+        contributor_name = "Unknown"
+        if contrib_member:
+            user = await db.users.find_one({"_id": ObjectId(contrib_member["user_id"])})
+            contributor_name = user["name"] if user else "Unknown"
+
+        result.append({
+            "id": str(contrib["_id"]),
+            "amount": contrib["amount"],
+            "contributor_name": contributor_name,
+            "contribution_date": contrib["contribution_date"],
+            "notes": contrib.get("notes"),
+            "created_at": contrib["created_at"]
+        })
+
+    return result
+
+# Investments (Portfolio) Endpoints
+@api_router.post("/investments/create")
+async def create_investment(data: InvestmentCreate, current_user: dict = Depends(get_current_user)):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can create investments")
+
+    investment_dict = {
+        "chama_id": data.chama_id,
+        "name": data.name,
+        "description": data.description,
+        "investment_type": data.investment_type,
+        "initial_amount": data.initial_amount,
+        "current_value": data.current_value,
+        "purchase_date": data.purchase_date,
+        "maturity_date": data.maturity_date,
+        "risk_level": data.risk_level,
+        "notes": data.notes,
+        "linked_goal_id": data.linked_goal_id,
+        "status": "active",
+        "total_returns": 0.0,
+        "created_by": str(current_user["_id"]),
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.investments.insert_one(investment_dict)
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "create_investment",
+        "details": f"Created investment: {data.name} - KES {data.initial_amount:,.2f}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"investment_id": str(result.inserted_id), "message": "Investment created successfully"}
+
+@api_router.get("/investments/{chama_id}")
+async def get_investments(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    investments = await db.investments.find({"chama_id": chama_id}).to_list(1000)
+
+    result = []
+    for inv in investments:
+        # Calculate ROI
+        roi = ((inv["current_value"] - inv["initial_amount"]) / inv["initial_amount"] * 100) if inv["initial_amount"] > 0 else 0
+
+        # Get returns count
+        returns_count = await db.investment_returns.count_documents({"investment_id": str(inv["_id"])})
+
+        result.append({
+            "id": str(inv["_id"]),
+            "name": inv["name"],
+            "description": inv.get("description"),
+            "investment_type": inv["investment_type"],
+            "initial_amount": inv["initial_amount"],
+            "current_value": inv["current_value"],
+            "purchase_date": inv["purchase_date"],
+            "maturity_date": inv.get("maturity_date"),
+            "risk_level": inv["risk_level"],
+            "status": inv["status"],
+            "total_returns": inv.get("total_returns", 0.0),
+            "roi": round(roi, 2),
+            "returns_count": returns_count,
+            "linked_goal_id": inv.get("linked_goal_id"),
+            "created_at": inv["created_at"]
+        })
+
+    return result
+
+@api_router.get("/investments/detail/{investment_id}")
+async def get_investment_details(investment_id: str, current_user: dict = Depends(get_current_user)):
+    inv = await db.investments.find_one({"_id": ObjectId(investment_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Investment not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": inv["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get returns
+    returns = await db.investment_returns.find({"investment_id": investment_id}).sort("return_date", -1).to_list(100)
+
+    returns_list = []
+    for ret in returns:
+        returns_list.append({
+            "id": str(ret["_id"]),
+            "amount": ret["return_amount"],
+            "return_date": ret["return_date"],
+            "return_type": ret["return_type"],
+            "notes": ret.get("notes"),
+            "created_at": ret["created_at"]
+        })
+
+    # Calculate ROI
+    roi = ((inv["current_value"] - inv["initial_amount"]) / inv["initial_amount"] * 100) if inv["initial_amount"] > 0 else 0
+
+    return {
+        "id": str(inv["_id"]),
+        "name": inv["name"],
+        "description": inv.get("description"),
+        "investment_type": inv["investment_type"],
+        "initial_amount": inv["initial_amount"],
+        "current_value": inv["current_value"],
+        "purchase_date": inv["purchase_date"],
+        "maturity_date": inv.get("maturity_date"),
+        "risk_level": inv["risk_level"],
+        "notes": inv.get("notes"),
+        "linked_goal_id": inv.get("linked_goal_id"),
+        "status": inv["status"],
+        "total_returns": inv.get("total_returns", 0.0),
+        "roi": round(roi, 2),
+        "returns": returns_list,
+        "created_at": inv["created_at"]
+    }
+
+@api_router.put("/investments/{investment_id}")
+async def update_investment(investment_id: str, data: InvestmentUpdate, current_user: dict = Depends(get_current_user)):
+    inv = await db.investments.find_one({"_id": ObjectId(investment_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Investment not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": inv["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can update investments")
+
+    update_data = {}
+    if data.name:
+        update_data["name"] = data.name
+    if data.description is not None:
+        update_data["description"] = data.description
+    if data.current_value is not None:
+        update_data["current_value"] = data.current_value
+    if data.maturity_date:
+        update_data["maturity_date"] = data.maturity_date
+    if data.status:
+        update_data["status"] = data.status
+    if data.notes is not None:
+        update_data["notes"] = data.notes
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No data to update")
+
+    await db.investments.update_one(
+        {"_id": ObjectId(investment_id)},
+        {"$set": update_data}
+    )
+
+    return {"message": "Investment updated successfully"}
+
+@api_router.delete("/investments/{investment_id}")
+async def delete_investment(investment_id: str, current_user: dict = Depends(get_current_user)):
+    inv = await db.investments.find_one({"_id": ObjectId(investment_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Investment not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": inv["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can delete investments")
+
+    await db.investments.delete_one({"_id": ObjectId(investment_id)})
+
+    # Delete associated returns
+    await db.investment_returns.delete_many({"investment_id": investment_id})
+
+    return {"message": "Investment deleted successfully"}
+
+# Investment Returns Endpoints
+@api_router.post("/investment-returns/create")
+async def create_investment_return(data: InvestmentReturnCreate, current_user: dict = Depends(get_current_user)):
+    inv = await db.investments.find_one({"_id": ObjectId(data.investment_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Investment not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": inv["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can record investment returns")
+
+    return_dict = {
+        "investment_id": data.investment_id,
+        "chama_id": inv["chama_id"],
+        "return_amount": data.return_amount,
+        "return_date": data.return_date,
+        "return_type": data.return_type,
+        "notes": data.notes,
+        "recorded_by": str(current_user["_id"]),
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.investment_returns.insert_one(return_dict)
+
+    # Update investment's total returns
+    await db.investments.update_one(
+        {"_id": ObjectId(data.investment_id)},
+        {"$inc": {"total_returns": data.return_amount}}
+    )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": inv["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "record_investment_return",
+        "details": f"Recorded {data.return_type} return: KES {data.return_amount:,.2f} for {inv['name']}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"return_id": str(result.inserted_id), "message": "Investment return recorded successfully"}
+
+@api_router.get("/investment-returns/{investment_id}")
+async def get_investment_returns(investment_id: str, current_user: dict = Depends(get_current_user)):
+    inv = await db.investments.find_one({"_id": ObjectId(investment_id)})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Investment not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": inv["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    returns = await db.investment_returns.find({"investment_id": investment_id}).sort("return_date", -1).to_list(100)
+
+    result = []
+    for ret in returns:
+        result.append({
+            "id": str(ret["_id"]),
+            "amount": ret["return_amount"],
+            "return_date": ret["return_date"],
+            "return_type": ret["return_type"],
+            "notes": ret.get("notes"),
+            "created_at": ret["created_at"]
+        })
+
+    return result
+
+# Investment Analytics
+@api_router.get("/investments/analytics/{chama_id}")
+async def get_investment_analytics(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get all investments
+    investments = await db.investments.find({"chama_id": chama_id}).to_list(1000)
+
+    total_invested = sum(inv["initial_amount"] for inv in investments)
+    total_current_value = sum(inv["current_value"] for inv in investments)
+    total_returns = sum(inv.get("total_returns", 0.0) for inv in investments)
+
+    overall_roi = ((total_current_value - total_invested) / total_invested * 100) if total_invested > 0 else 0
+
+    # Group by investment type
+    by_type = {}
+    for inv in investments:
+        inv_type = inv["investment_type"]
+        if inv_type not in by_type:
+            by_type[inv_type] = {
+                "count": 0,
+                "total_invested": 0,
+                "total_current_value": 0,
+                "total_returns": 0
+            }
+        by_type[inv_type]["count"] += 1
+        by_type[inv_type]["total_invested"] += inv["initial_amount"]
+        by_type[inv_type]["total_current_value"] += inv["current_value"]
+        by_type[inv_type]["total_returns"] += inv.get("total_returns", 0.0)
+
+    # Get all goals
+    goals = await db.investment_goals.find({"chama_id": chama_id}).to_list(1000)
+
+    total_goal_target = sum(g["target_amount"] for g in goals if g["status"] == "active")
+    total_goal_current = sum(g["current_amount"] for g in goals if g["status"] == "active")
+    completed_goals = len([g for g in goals if g["status"] == "completed"])
+
+    return {
+        "total_invested": total_invested,
+        "total_current_value": total_current_value,
+        "total_returns": total_returns,
+        "overall_roi": round(overall_roi, 2),
+        "total_profit_loss": total_current_value - total_invested + total_returns,
+        "investment_count": len(investments),
+        "by_type": by_type,
+        "goals_summary": {
+            "active_goals": len([g for g in goals if g["status"] == "active"]),
+            "completed_goals": completed_goals,
+            "total_target": total_goal_target,
+            "total_saved": total_goal_current,
+            "overall_progress": (total_goal_current / total_goal_target * 100) if total_goal_target > 0 else 0
+        }
+    }
 
 app.include_router(api_router)
 
