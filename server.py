@@ -240,6 +240,7 @@ class GoalContributionCreate(BaseModel):
     amount: float
     contribution_date: Optional[str] = None
     notes: Optional[str] = None
+    funding_source: Optional[str] = "external"  # "group_balance" or "external"
 
 class InvestmentCreate(BaseModel):
     chama_id: str
@@ -253,6 +254,7 @@ class InvestmentCreate(BaseModel):
     risk_level: str  # low, medium, high
     notes: Optional[str] = None
     linked_goal_id: Optional[str] = None
+    funding_source: Optional[str] = "external"  # "group_balance" or "external"
 
 class InvestmentUpdate(BaseModel):
     name: Optional[str] = None
@@ -268,6 +270,42 @@ class InvestmentReturnCreate(BaseModel):
     return_date: str
     return_type: str  # dividend, interest, capital_gain, sale_proceeds
     notes: Optional[str] = None
+
+class MeetingCreate(BaseModel):
+    chama_id: str
+    title: str
+    description: Optional[str] = None
+    agenda: Optional[str] = None
+    start_time: str  # ISO datetime
+    end_time: Optional[str] = None
+    location: Optional[str] = None
+    virtual_link: Optional[str] = None
+    recurring: bool = False
+    recurring_frequency: Optional[str] = None  # weekly, monthly
+
+class MeetingUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    agenda: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    location: Optional[str] = None
+    virtual_link: Optional[str] = None
+    status: Optional[str] = None  # scheduled, cancelled, completed
+
+class RSVPCreate(BaseModel):
+    status: str  # attending, not_attending, maybe
+
+class AttendanceCreate(BaseModel):
+    meeting_id: str
+    method: str = "manual"  # manual, qr
+    notes: Optional[str] = None
+
+class MinutesCreate(BaseModel):
+    meeting_id: str
+    content: str
+    decisions: Optional[str] = None
+    action_items: Optional[str] = None
 
 # Authentication Endpoints
 @api_router.post("/auth/register")
@@ -2653,6 +2691,498 @@ async def get_investment_analytics(chama_id: str, current_user: dict = Depends(g
             "total_saved": total_goal_current,
             "overall_progress": (total_goal_current / total_goal_target * 100) if total_goal_target > 0 else 0
         }
+    }
+
+# Meetings Endpoints
+@api_router.post("/meetings/create")
+async def create_meeting(data: MeetingCreate, current_user: dict = Depends(get_current_user)):
+    # Verify admin or secretary
+    member = await db.members.find_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] not in ["admin", "secretary"]:
+        raise HTTPException(status_code=403, detail="Only admins and secretaries can create meetings")
+
+    meeting_dict = {
+        "chama_id": data.chama_id,
+        "title": data.title,
+        "description": data.description,
+        "agenda": data.agenda,
+        "start_time": data.start_time,
+        "end_time": data.end_time,
+        "location": data.location,
+        "virtual_link": data.virtual_link,
+        "recurring": data.recurring,
+        "recurring_frequency": data.recurring_frequency,
+        "status": "scheduled",
+        "created_by": str(current_user["_id"]),
+        "created_at": datetime.utcnow().isoformat(),
+        "rsvp_count": {
+            "attending": 0,
+            "not_attending": 0,
+            "maybe": 0
+        },
+        "attendance_count": 0
+    }
+
+    result = await db.meetings.insert_one(meeting_dict)
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "create_meeting",
+        "details": f"Created meeting: {data.title}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    # Create announcement for the meeting
+    await db.announcements.insert_one({
+        "chama_id": data.chama_id,
+        "title": f"Meeting Scheduled: {data.title}",
+        "message": f"A new meeting has been scheduled for {data.start_time}. Location: {data.location or 'Virtual'}",
+        "created_by": str(current_user["_id"]),
+        "created_at": datetime.utcnow().isoformat()
+    })
+
+    return {"meeting_id": str(result.inserted_id), "message": "Meeting created successfully"}
+
+@api_router.get("/meetings/{chama_id}")
+async def get_meetings(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    meetings = await db.meetings.find({"chama_id": chama_id}).sort("start_time", -1).to_list(100)
+
+    result = []
+    for meeting in meetings:
+        # Get creator details
+        creator = await db.users.find_one({"_id": ObjectId(meeting["created_by"])})
+        creator_name = creator["name"] if creator else "Unknown"
+
+        # Check user's RSVP status
+        rsvp = await db.meeting_rsvps.find_one({
+            "meeting_id": str(meeting["_id"]),
+            "member_id": str(member["_id"])
+        })
+        user_rsvp = rsvp["status"] if rsvp else None
+
+        # Check if user attended
+        attendance = await db.meeting_attendance.find_one({
+            "meeting_id": str(meeting["_id"]),
+            "member_id": str(member["_id"])
+        })
+        user_attended = bool(attendance)
+
+        result.append({
+            "id": str(meeting["_id"]),
+            "title": meeting["title"],
+            "description": meeting.get("description"),
+            "agenda": meeting.get("agenda"),
+            "start_time": meeting["start_time"],
+            "end_time": meeting.get("end_time"),
+            "location": meeting.get("location"),
+            "virtual_link": meeting.get("virtual_link"),
+            "status": meeting["status"],
+            "created_by": creator_name,
+            "rsvp_count": meeting.get("rsvp_count", {"attending": 0, "not_attending": 0, "maybe": 0}),
+            "attendance_count": meeting.get("attendance_count", 0),
+            "user_rsvp": user_rsvp,
+            "user_attended": user_attended,
+            "created_at": meeting["created_at"]
+        })
+
+    return result
+
+@api_router.get("/meetings/detail/{meeting_id}")
+async def get_meeting_details(meeting_id: str, current_user: dict = Depends(get_current_user)):
+    meeting = await db.meetings.find_one({"_id": ObjectId(meeting_id)})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get RSVPs
+    rsvps = await db.meeting_rsvps.find({"meeting_id": meeting_id}).to_list(1000)
+    rsvp_list = []
+    for rsvp in rsvps:
+        rsvp_member = await db.members.find_one({"_id": ObjectId(rsvp["member_id"])})
+        member_name = "Unknown"
+        if rsvp_member:
+            user = await db.users.find_one({"_id": ObjectId(rsvp_member["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        rsvp_list.append({
+            "member_name": member_name,
+            "status": rsvp["status"],
+            "rsvp_at": rsvp["rsvp_at"]
+        })
+
+    # Get attendance
+    attendance_records = await db.meeting_attendance.find({"meeting_id": meeting_id}).to_list(1000)
+    attendance_list = []
+    for att in attendance_records:
+        att_member = await db.members.find_one({"_id": ObjectId(att["member_id"])})
+        member_name = "Unknown"
+        if att_member:
+            user = await db.users.find_one({"_id": ObjectId(att_member["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        attendance_list.append({
+            "member_name": member_name,
+            "checked_in_at": att["checked_in_at"],
+            "method": att.get("method", "manual")
+        })
+
+    # Get minutes if exists
+    minutes = await db.meeting_minutes.find_one({"meeting_id": meeting_id})
+    minutes_data = None
+    if minutes:
+        minutes_author = await db.users.find_one({"_id": ObjectId(minutes["created_by"])})
+        minutes_data = {
+            "id": str(minutes["_id"]),
+            "content": minutes["content"],
+            "decisions": minutes.get("decisions"),
+            "action_items": minutes.get("action_items"),
+            "created_by": minutes_author["name"] if minutes_author else "Unknown",
+            "created_at": minutes["created_at"]
+        }
+
+    # Check user's RSVP
+    user_rsvp = await db.meeting_rsvps.find_one({
+        "meeting_id": meeting_id,
+        "member_id": str(member["_id"])
+    })
+
+    # Check if user attended
+    user_attendance = await db.meeting_attendance.find_one({
+        "meeting_id": meeting_id,
+        "member_id": str(member["_id"])
+    })
+
+    return {
+        "id": str(meeting["_id"]),
+        "title": meeting["title"],
+        "description": meeting.get("description"),
+        "agenda": meeting.get("agenda"),
+        "start_time": meeting["start_time"],
+        "end_time": meeting.get("end_time"),
+        "location": meeting.get("location"),
+        "virtual_link": meeting.get("virtual_link"),
+        "status": meeting["status"],
+        "recurring": meeting.get("recurring", False),
+        "recurring_frequency": meeting.get("recurring_frequency"),
+        "rsvp_count": meeting.get("rsvp_count", {"attending": 0, "not_attending": 0, "maybe": 0}),
+        "attendance_count": meeting.get("attendance_count", 0),
+        "rsvps": rsvp_list,
+        "attendance": attendance_list,
+        "minutes": minutes_data,
+        "user_rsvp": user_rsvp["status"] if user_rsvp else None,
+        "user_attended": bool(user_attendance),
+        "created_at": meeting["created_at"]
+    }
+
+@api_router.put("/meetings/{meeting_id}")
+async def update_meeting(meeting_id: str, data: MeetingUpdate, current_user: dict = Depends(get_current_user)):
+    meeting = await db.meetings.find_one({"_id": ObjectId(meeting_id)})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Verify admin or secretary
+    member = await db.members.find_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] not in ["admin", "secretary"]:
+        raise HTTPException(status_code=403, detail="Only admins and secretaries can update meetings")
+
+    update_data = {}
+    if data.title:
+        update_data["title"] = data.title
+    if data.description is not None:
+        update_data["description"] = data.description
+    if data.agenda is not None:
+        update_data["agenda"] = data.agenda
+    if data.start_time:
+        update_data["start_time"] = data.start_time
+    if data.end_time is not None:
+        update_data["end_time"] = data.end_time
+    if data.location is not None:
+        update_data["location"] = data.location
+    if data.virtual_link is not None:
+        update_data["virtual_link"] = data.virtual_link
+    if data.status:
+        update_data["status"] = data.status
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No data to update")
+
+    await db.meetings.update_one(
+        {"_id": ObjectId(meeting_id)},
+        {"$set": update_data}
+    )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "update_meeting",
+        "details": f"Updated meeting: {meeting['title']}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"message": "Meeting updated successfully"}
+
+@api_router.delete("/meetings/{meeting_id}")
+async def delete_meeting(meeting_id: str, current_user: dict = Depends(get_current_user)):
+    meeting = await db.meetings.find_one({"_id": ObjectId(meeting_id)})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can delete meetings")
+
+    await db.meetings.delete_one({"_id": ObjectId(meeting_id)})
+
+    # Delete related data
+    await db.meeting_rsvps.delete_many({"meeting_id": meeting_id})
+    await db.meeting_attendance.delete_many({"meeting_id": meeting_id})
+    await db.meeting_minutes.delete_many({"meeting_id": meeting_id})
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "delete_meeting",
+        "details": f"Deleted meeting: {meeting['title']}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"message": "Meeting deleted successfully"}
+
+@api_router.post("/meetings/{meeting_id}/rsvp")
+async def rsvp_meeting(meeting_id: str, data: RSVPCreate, current_user: dict = Depends(get_current_user)):
+    meeting = await db.meetings.find_one({"_id": ObjectId(meeting_id)})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Check if RSVP already exists
+    existing_rsvp = await db.meeting_rsvps.find_one({
+        "meeting_id": meeting_id,
+        "member_id": str(member["_id"])
+    })
+
+    if existing_rsvp:
+        # Update existing RSVP - adjust counts
+        old_status = existing_rsvp["status"]
+        await db.meeting_rsvps.update_one(
+            {"_id": existing_rsvp["_id"]},
+            {"$set": {
+                "status": data.status,
+                "rsvp_at": datetime.utcnow().isoformat()
+            }}
+        )
+
+        # Update meeting RSVP counts
+        await db.meetings.update_one(
+            {"_id": ObjectId(meeting_id)},
+            {
+                "$inc": {
+                    f"rsvp_count.{old_status}": -1,
+                    f"rsvp_count.{data.status}": 1
+                }
+            }
+        )
+    else:
+        # Create new RSVP
+        rsvp_dict = {
+            "meeting_id": meeting_id,
+            "chama_id": meeting["chama_id"],
+            "member_id": str(member["_id"]),
+            "user_id": str(current_user["_id"]),
+            "status": data.status,
+            "rsvp_at": datetime.utcnow().isoformat()
+        }
+        await db.meeting_rsvps.insert_one(rsvp_dict)
+
+        # Update meeting RSVP count
+        await db.meetings.update_one(
+            {"_id": ObjectId(meeting_id)},
+            {"$inc": {f"rsvp_count.{data.status}": 1}}
+        )
+
+    return {"message": "RSVP recorded successfully", "status": data.status}
+
+@api_router.post("/meetings/{meeting_id}/attendance")
+async def mark_attendance(meeting_id: str, data: AttendanceCreate, current_user: dict = Depends(get_current_user)):
+    meeting = await db.meetings.find_one({"_id": ObjectId(meeting_id)})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Check if already marked attendance
+    existing_attendance = await db.meeting_attendance.find_one({
+        "meeting_id": meeting_id,
+        "member_id": str(member["_id"])
+    })
+
+    if existing_attendance:
+        return {"message": "Attendance already recorded", "checked_in_at": existing_attendance["checked_in_at"]}
+
+    # Create attendance record
+    attendance_dict = {
+        "meeting_id": meeting_id,
+        "chama_id": meeting["chama_id"],
+        "member_id": str(member["_id"]),
+        "user_id": str(current_user["_id"]),
+        "checked_in_at": datetime.utcnow().isoformat(),
+        "method": data.method,
+        "notes": data.notes
+    }
+    await db.meeting_attendance.insert_one(attendance_dict)
+
+    # Update meeting attendance count
+    await db.meetings.update_one(
+        {"_id": ObjectId(meeting_id)},
+        {"$inc": {"attendance_count": 1}}
+    )
+
+    return {"message": "Attendance recorded successfully"}
+
+@api_router.post("/meetings/{meeting_id}/minutes")
+async def save_meeting_minutes(meeting_id: str, data: MinutesCreate, current_user: dict = Depends(get_current_user)):
+    meeting = await db.meetings.find_one({"_id": ObjectId(meeting_id)})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Verify admin or secretary
+    member = await db.members.find_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] not in ["admin", "secretary"]:
+        raise HTTPException(status_code=403, detail="Only admins and secretaries can save minutes")
+
+    # Check if minutes already exist
+    existing_minutes = await db.meeting_minutes.find_one({"meeting_id": meeting_id})
+
+    if existing_minutes:
+        # Update existing minutes
+        await db.meeting_minutes.update_one(
+            {"_id": existing_minutes["_id"]},
+            {"$set": {
+                "content": data.content,
+                "decisions": data.decisions,
+                "action_items": data.action_items,
+                "updated_by": str(current_user["_id"]),
+                "updated_at": datetime.utcnow().isoformat()
+            }}
+        )
+        minutes_id = str(existing_minutes["_id"])
+    else:
+        # Create new minutes
+        minutes_dict = {
+            "meeting_id": meeting_id,
+            "chama_id": meeting["chama_id"],
+            "content": data.content,
+            "decisions": data.decisions,
+            "action_items": data.action_items,
+            "created_by": str(current_user["_id"]),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        result = await db.meeting_minutes.insert_one(minutes_dict)
+        minutes_id = str(result.inserted_id)
+
+    # Update meeting status to completed if not already
+    if meeting["status"] != "completed":
+        await db.meetings.update_one(
+            {"_id": ObjectId(meeting_id)},
+            {"$set": {"status": "completed"}}
+        )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "save_meeting_minutes",
+        "details": f"Saved minutes for meeting: {meeting['title']}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"minutes_id": minutes_id, "message": "Minutes saved successfully"}
+
+@api_router.get("/meetings/{meeting_id}/minutes")
+async def get_meeting_minutes(meeting_id: str, current_user: dict = Depends(get_current_user)):
+    meeting = await db.meetings.find_one({"_id": ObjectId(meeting_id)})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": meeting["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    minutes = await db.meeting_minutes.find_one({"meeting_id": meeting_id})
+    if not minutes:
+        raise HTTPException(status_code=404, detail="No minutes found for this meeting")
+
+    # Get author details
+    author = await db.users.find_one({"_id": ObjectId(minutes["created_by"])})
+    author_name = author["name"] if author else "Unknown"
+
+    return {
+        "id": str(minutes["_id"]),
+        "meeting_id": meeting_id,
+        "content": minutes["content"],
+        "decisions": minutes.get("decisions"),
+        "action_items": minutes.get("action_items"),
+        "created_by": author_name,
+        "created_at": minutes["created_at"],
+        "updated_at": minutes.get("updated_at")
     }
 
 app.include_router(api_router)
