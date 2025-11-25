@@ -24,6 +24,13 @@ from reportlab.lib import colors
 import base64
 import asyncio
 import calendar
+from loan_calculator import (
+    generate_amortization_schedule,
+    calculate_monthly_payment,
+    validate_loan_parameters as validate_loan_params,
+    calculate_payment_breakdown,
+    calculate_affordability
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -147,8 +154,9 @@ class LoanRequest(BaseModel):
     chama_id: str
     amount: float
     reason: str
-    repayment_period: int  # days
-    interest_rate: float = 10.0
+    repayment_period: int  # months (changed from days)
+    interest_rate: float = 12.0  # annual rate
+    payment_frequency: str = "monthly"  # monthly, weekly, biweekly
 
 class LoanApproval(BaseModel):
     loan_id: str
@@ -1493,23 +1501,70 @@ async def request_loan(data: LoanRequest, current_user: dict = Depends(get_curre
     })
     if not member:
         raise HTTPException(status_code=403, detail="Not a member of this Chama")
-    
+
+    # Validate loan parameters
+    validation = validate_loan_params(data.amount, data.interest_rate, data.repayment_period)
+    if not validation["is_valid"]:
+        raise HTTPException(status_code=400, detail="; ".join(validation["errors"]))
+
+    # Generate amortization schedule
+    amortization = generate_amortization_schedule(
+        principal=data.amount,
+        annual_interest_rate=data.interest_rate,
+        term_in_months=data.repayment_period,
+        start_date=datetime.utcnow().isoformat(),
+        payment_frequency=data.payment_frequency
+    )
+
+    amortization_dict = amortization.to_dict()
+
+    # Calculate monthly payment
+    monthly_payment = calculate_monthly_payment(
+        data.amount,
+        data.interest_rate,
+        data.repayment_period
+    )
+
     loan_dict = {
         "chama_id": data.chama_id,
         "member_id": str(member["_id"]),
         "user_id": str(current_user["_id"]),
         "amount": data.amount,
         "interest_rate": data.interest_rate,
+        "interest_amount": round(amortization_dict["total_interest"], 2),
+        "total_amount_due": round(amortization_dict["total_payment"], 2),
+        "monthly_payment": round(monthly_payment, 2),
         "reason": data.reason,
         "repayment_period": data.repayment_period,
+        "payment_frequency": data.payment_frequency,
+        "number_of_installments": amortization_dict["number_of_payments"],
+        "amortization_schedule": amortization_dict["schedule"],
         "status": "pending",
         "approved_date": None,
-        "outstanding_balance": data.amount,
+        "outstanding_balance": round(amortization_dict["total_payment"], 2),
+        "next_payment_due": amortization_dict["schedule"][0]["due_date"] if amortization_dict["schedule"] else None,
+        "paid_installments": [],
         "created_at": datetime.utcnow().isoformat()
     }
-    
+
     result = await db.loans.insert_one(loan_dict)
-    return {"loan_id": str(result.inserted_id), "message": "Loan request submitted"}
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "request_loan",
+        "details": f"Loan requested: KES {data.amount} for {data.repayment_period} months at {data.interest_rate}%",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "loan_id": str(result.inserted_id),
+        "message": "Loan request submitted",
+        "monthly_payment": round(monthly_payment, 2),
+        "total_interest": round(amortization_dict["total_interest"], 2),
+        "total_payable": round(amortization_dict["total_payment"], 2)
+    }
 
 @api_router.get("/loans/{chama_id}")
 async def get_loans(chama_id: str, current_user: dict = Depends(get_current_user)):
@@ -1532,12 +1587,15 @@ async def get_loans(chama_id: str, current_user: dict = Depends(get_current_user
             "member_name": user["name"] if user else "Unknown",
             "amount": loan["amount"],
             "interest_rate": loan["interest_rate"],
+            "interest_amount": loan.get("interest_amount", 0),
+            "total_amount_due": loan.get("total_amount_due", loan["amount"]),
             "reason": loan["reason"],
             "status": loan["status"],
-            "outstanding_balance": loan.get("outstanding_balance", loan["amount"]),
+            "outstanding_balance": loan.get("outstanding_balance", loan.get("total_amount_due", loan["amount"])),
+            "repayment_period": loan.get("repayment_period", 0),
             "created_at": loan["created_at"]
         })
-    
+
     return result
 
 @api_router.put("/loans/approve")
@@ -1580,7 +1638,11 @@ async def repay_loan(data: RepaymentCreate, current_user: dict = Depends(get_cur
     loan = await db.loans.find_one({"_id": ObjectId(data.loan_id)})
     if not loan:
         raise HTTPException(status_code=404, detail="Loan not found")
-    
+
+    # Verify loan is approved
+    if loan["status"] != "approved":
+        raise HTTPException(status_code=400, detail="Can only repay approved loans")
+
     # Verify admin or loan owner
     member = await db.members.find_one({
         "chama_id": loan["chama_id"],
@@ -1589,25 +1651,309 @@ async def repay_loan(data: RepaymentCreate, current_user: dict = Depends(get_cur
     })
     if not member:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    # Calculate payment breakdown (principal vs interest)
+    outstanding_balance = loan.get("outstanding_balance", loan.get("total_amount_due", loan["amount"]))
+    monthly_payment = loan.get("monthly_payment", 0)
+
+    breakdown = calculate_payment_breakdown(
+        remaining_balance=outstanding_balance,
+        annual_interest_rate=loan.get("interest_rate", 0),
+        regular_payment=data.amount
+    )
+
+    # Determine next installment to pay from schedule
+    paid_installments = loan.get("paid_installments", [])
+    amortization_schedule = loan.get("amortization_schedule", [])
+
+    next_installment_index = len(paid_installments)
+    next_installment = None
+
+    if amortization_schedule and next_installment_index < len(amortization_schedule):
+        next_installment = amortization_schedule[next_installment_index]
+
     # Create repayment record
     repayment_dict = {
         "loan_id": data.loan_id,
         "amount": data.amount,
+        "principal_amount": round(breakdown["principal"], 2),
+        "interest_amount": round(breakdown["interest"], 2),
+        "installment_number": next_installment_index + 1 if next_installment else None,
+        "scheduled_date": next_installment["due_date"] if next_installment else None,
         "payment_date": datetime.utcnow().isoformat(),
         "confirmed_by": str(current_user["_id"]),
+        "balance_after_payment": max(0, outstanding_balance - data.amount),
         "created_at": datetime.utcnow().isoformat()
     }
     await db.repayments.insert_one(repayment_dict)
-    
-    # Update loan balance
-    new_balance = loan.get("outstanding_balance", loan["amount"]) - data.amount
+
+    # Update loan balance and paid installments
+    new_balance = max(0, outstanding_balance - data.amount)
+    update_data = {
+        "outstanding_balance": round(new_balance, 2),
+        "last_payment_date": datetime.utcnow().isoformat()
+    }
+
+    # Mark installment as paid if it matches
+    if next_installment:
+        paid_installments.append({
+            "installment_number": next_installment_index + 1,
+            "due_date": next_installment["due_date"],
+            "paid_date": datetime.utcnow().isoformat(),
+            "amount_paid": data.amount,
+            "principal": breakdown["principal"],
+            "interest": breakdown["interest"]
+        })
+        update_data["paid_installments"] = paid_installments
+
+        # Update next payment due date
+        if next_installment_index + 1 < len(amortization_schedule):
+            update_data["next_payment_due"] = amortization_schedule[next_installment_index + 1]["due_date"]
+        else:
+            update_data["next_payment_due"] = None
+
+    # Mark loan as fully paid if balance is zero
+    if new_balance < 0.01:  # Account for rounding
+        update_data["status"] = "fully_paid"
+        update_data["paid_date"] = datetime.utcnow().isoformat()
+
     await db.loans.update_one(
         {"_id": ObjectId(data.loan_id)},
-        {"$set": {"outstanding_balance": max(0, new_balance)}}
+        {"$set": update_data}
     )
-    
-    return {"message": "Repayment recorded", "remaining_balance": max(0, new_balance)}
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": loan["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "loan_repayment",
+        "details": f"Repayment: KES {data.amount} (Principal: {breakdown['principal']}, Interest: {breakdown['interest']})",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "message": "Repayment recorded successfully",
+        "remaining_balance": round(new_balance, 2),
+        "principal_paid": round(breakdown["principal"], 2),
+        "interest_paid": round(breakdown["interest"], 2),
+        "installments_paid": len(paid_installments),
+        "installments_remaining": len(amortization_schedule) - len(paid_installments) if amortization_schedule else 0,
+        "next_payment_due": update_data.get("next_payment_due"),
+        "fully_paid": new_balance < 0.01
+    }
+
+# Loan Calculator Endpoints
+@api_router.get("/loans/{loan_id}/amortization-schedule")
+async def get_loan_amortization_schedule(loan_id: str, current_user: dict = Depends(get_current_user)):
+    """Get detailed amortization schedule for a specific loan"""
+    loan = await db.loans.find_one({"_id": ObjectId(loan_id)})
+    if not loan:
+        raise HTTPException(status_code=404, detail="Loan not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": loan["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get user details
+    user = await db.users.find_one({"_id": ObjectId(loan["user_id"])})
+
+    # Get repayment history
+    repayments = await db.repayments.find({"loan_id": loan_id}).to_list(1000)
+
+    return {
+        "loan_id": loan_id,
+        "borrower_name": user["name"] if user else "Unknown",
+        "principal": loan["amount"],
+        "interest_rate": loan["interest_rate"],
+        "term_months": loan["repayment_period"],
+        "monthly_payment": loan.get("monthly_payment", 0),
+        "total_interest": loan.get("interest_amount", 0),
+        "total_payable": loan.get("total_amount_due", 0),
+        "outstanding_balance": loan.get("outstanding_balance", 0),
+        "status": loan["status"],
+        "amortization_schedule": loan.get("amortization_schedule", []),
+        "paid_installments": loan.get("paid_installments", []),
+        "next_payment_due": loan.get("next_payment_due"),
+        "payment_frequency": loan.get("payment_frequency", "monthly"),
+        "repayment_history": [
+            {
+                "payment_date": r["payment_date"],
+                "amount": r["amount"],
+                "principal": r.get("principal_amount", 0),
+                "interest": r.get("interest_amount", 0),
+                "balance_after": r.get("balance_after_payment", 0)
+            }
+            for r in repayments
+        ]
+    }
+
+@api_router.post("/loans/calculate")
+async def calculate_loan(
+    principal: float,
+    interest_rate: float,
+    term_months: int,
+    payment_frequency: str = "monthly"
+):
+    """Calculate loan details without creating a loan request"""
+    # Validate parameters
+    validation = validate_loan_params(principal, interest_rate, term_months)
+    if not validation["is_valid"]:
+        raise HTTPException(status_code=400, detail="; ".join(validation["errors"]))
+
+    # Generate amortization
+    amortization = generate_amortization_schedule(
+        principal=principal,
+        annual_interest_rate=interest_rate,
+        term_in_months=term_months,
+        payment_frequency=payment_frequency
+    )
+
+    monthly_payment = calculate_monthly_payment(principal, interest_rate, term_months)
+
+    return {
+        "principal": principal,
+        "interest_rate": interest_rate,
+        "term_months": term_months,
+        "payment_frequency": payment_frequency,
+        "monthly_payment": round(monthly_payment, 2),
+        "total_interest": round(amortization.total_interest, 2),
+        "total_payable": round(amortization.total_payment, 2),
+        "number_of_payments": amortization.number_of_payments,
+        "schedule": [s.to_dict() for s in amortization.schedule]
+    }
+
+@api_router.post("/loans/affordability-check")
+async def check_loan_affordability(
+    monthly_income: float,
+    existing_debts: float,
+    loan_amount: float,
+    interest_rate: float,
+    term_months: int
+):
+    """Check if a proposed loan is affordable based on income"""
+    # Calculate monthly payment
+    monthly_payment = calculate_monthly_payment(loan_amount, interest_rate, term_months)
+
+    # Check affordability
+    affordability_result = calculate_affordability(
+        monthly_income=monthly_income,
+        existing_monthly_debts=existing_debts,
+        proposed_loan_payment=monthly_payment
+    )
+
+    return {
+        "monthly_payment": round(monthly_payment, 2),
+        "monthly_income": monthly_income,
+        "existing_debts": existing_debts,
+        "current_dti": affordability_result["current_dti"],
+        "new_dti": affordability_result["new_dti"],
+        "is_affordable": affordability_result["is_affordable"],
+        "max_affordable_payment": affordability_result["max_affordable_payment"],
+        "recommendation": (
+            "This loan is affordable and within recommended debt limits."
+            if affordability_result["is_affordable"]
+            else f"This loan would exceed the recommended 36% debt-to-income ratio. "
+                 f"Consider reducing the loan amount or extending the term."
+        )
+    }
+
+@api_router.post("/loans/max-loan-calculator")
+async def calculate_max_loan(
+    monthly_payment_capacity: float,
+    interest_rate: float,
+    term_months: int
+):
+    """Calculate maximum affordable loan based on payment capacity"""
+    from loan_calculator import calculate_max_loan_amount
+
+    max_loan = calculate_max_loan_amount(
+        monthly_payment_capacity=monthly_payment_capacity,
+        annual_interest_rate=interest_rate,
+        term_in_months=term_months
+    )
+
+    total_interest = max_loan * (interest_rate / 100) * (term_months / 12)
+
+    return {
+        "max_loan_amount": round(max_loan, 2),
+        "monthly_payment": monthly_payment_capacity,
+        "interest_rate": interest_rate,
+        "term_months": term_months,
+        "total_interest": round(total_interest, 2),
+        "message": f"Based on a monthly payment capacity of KES {monthly_payment_capacity:,.2f}, "
+                   f"you can borrow up to KES {max_loan:,.2f} over {term_months} months at {interest_rate}% interest."
+    }
+
+@api_router.get("/loans/{loan_id}/payment-schedule-status")
+async def get_payment_schedule_status(loan_id: str, current_user: dict = Depends(get_current_user)):
+    """Get payment schedule with status (paid, overdue, upcoming)"""
+    loan = await db.loans.find_one({"_id": ObjectId(loan_id)})
+    if not loan:
+        raise HTTPException(status_code=404, detail="Loan not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": loan["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    schedule = loan.get("amortization_schedule", [])
+    paid_installments = loan.get("paid_installments", [])
+    paid_numbers = {inst["installment_number"] for inst in paid_installments}
+
+    today = datetime.utcnow().date()
+
+    enriched_schedule = []
+    for installment in schedule:
+        payment_num = installment["payment_number"]
+        due_date = datetime.fromisoformat(installment["due_date"]).date()
+
+        # Determine status
+        if payment_num in paid_numbers:
+            status = "paid"
+            paid_inst = next((p for p in paid_installments if p["installment_number"] == payment_num), None)
+            paid_date = paid_inst["paid_date"] if paid_inst else None
+        elif due_date < today:
+            status = "overdue"
+            paid_date = None
+        elif due_date == today:
+            status = "due_today"
+            paid_date = None
+        else:
+            status = "upcoming"
+            paid_date = None
+
+        enriched_schedule.append({
+            **installment,
+            "status": status,
+            "paid_date": paid_date,
+            "days_overdue": (today - due_date).days if status == "overdue" else 0
+        })
+
+    # Calculate summary stats
+    paid_count = len(paid_installments)
+    overdue_count = sum(1 for s in enriched_schedule if s["status"] == "overdue")
+    upcoming_count = sum(1 for s in enriched_schedule if s["status"] == "upcoming")
+
+    return {
+        "loan_id": loan_id,
+        "schedule": enriched_schedule,
+        "summary": {
+            "total_installments": len(schedule),
+            "paid_installments": paid_count,
+            "overdue_installments": overdue_count,
+            "upcoming_installments": upcoming_count,
+            "completion_rate": round((paid_count / len(schedule) * 100) if schedule else 0, 1)
+        }
+    }
 
 # Dashboard & Reports
 @api_router.get("/dashboard/{chama_id}")
@@ -2051,8 +2397,8 @@ async def get_financial_statement(chama_id: str, current_user: dict = Depends(ge
 
     total_equity = member_equity + retained_earnings
 
-    # Income Statement
-    interest_income = sum(l["amount"] * (l["interest_rate"] / 100) for l in loans)
+    # Income Statement - use actual interest amounts from approved/completed loans
+    interest_income = sum(l.get("interest_amount", 0) for l in loans if l["status"] in ["approved", "rejected"])
     total_income = interest_income
 
     # Expenses (simplified - could include admin costs, etc.)
