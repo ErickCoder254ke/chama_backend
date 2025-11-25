@@ -1578,7 +1578,12 @@ async def get_dashboard(chama_id: str, current_user: dict = Depends(get_current_
 
 # Reports & Analytics Endpoints
 @api_router.get("/reports/analytics/{chama_id}")
-async def get_reports_analytics(chama_id: str, current_user: dict = Depends(get_current_user)):
+async def get_reports_analytics(
+    chama_id: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
     # Verify membership
     member = await db.members.find_one({
         "chama_id": chama_id,
@@ -1588,8 +1593,23 @@ async def get_reports_analytics(chama_id: str, current_user: dict = Depends(get_
     if not member:
         raise HTTPException(status_code=403, detail="Not a member of this Chama")
 
+    # Build date filter if provided
+    date_filter = {}
+    if start_date or end_date:
+        date_filter["paid_date"] = {}
+        if start_date:
+            date_filter["paid_date"]["$gte"] = start_date
+        if end_date:
+            date_filter["paid_date"]["$lte"] = end_date
+
     # Get all data for analytics
-    contributions = await db.contributions.find({"chama_id": chama_id}).to_list(10000)
+    contribution_filter = {"chama_id": chama_id}
+    if date_filter:
+        contribution_filter.update(date_filter)
+
+    contributions = await db.contributions.find(contribution_filter).to_list(10000)
+
+    # For loans, we don't filter by date range for now (use approved_date if needed)
     loans = await db.loans.find({"chama_id": chama_id}).to_list(10000)
     members_list = await db.members.find({"chama_id": chama_id, "status": "active"}).to_list(10000)
 
