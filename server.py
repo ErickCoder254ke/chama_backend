@@ -307,6 +307,76 @@ class MinutesCreate(BaseModel):
     decisions: Optional[str] = None
     action_items: Optional[str] = None
 
+class WelfareSettingsUpdate(BaseModel):
+    enabled: bool = True
+    monthly_contribution: Optional[float] = None
+    max_request_amount: Optional[float] = 50000
+    approval_threshold: Optional[float] = 0.75  # 75% approval required
+    processing_days: Optional[int] = 5
+
+class WelfareContributionCreate(BaseModel):
+    amount: float
+    contribution_date: Optional[str] = None
+    notes: Optional[str] = None
+
+class WelfareRequestCreate(BaseModel):
+    chama_id: str
+    request_type: str  # medical, bereavement, education, emergency
+    amount: float
+    reason: str
+    supporting_documents: Optional[List[str]] = None  # base64 images/docs
+    description: Optional[str] = None
+
+class WelfareRequestUpdate(BaseModel):
+    status: Optional[str] = None  # pending, approved, rejected, disbursed
+    admin_notes: Optional[str] = None
+    disbursement_date: Optional[str] = None
+    disbursement_method: Optional[str] = None
+    transaction_reference: Optional[str] = None
+
+class WelfareVoteCreate(BaseModel):
+    request_id: str
+    vote: str  # approve, reject
+    comment: Optional[str] = None
+
+# Share Management Models
+class ShareSettingsUpdate(BaseModel):
+    enabled: bool = True
+    total_shares: Optional[int] = 1000
+    share_price: Optional[float] = 5000.0
+    min_shares_per_member: Optional[int] = 1
+    max_shares_per_member: Optional[int] = None
+    allow_share_transfer: Optional[bool] = True
+
+class SharePurchaseCreate(BaseModel):
+    chama_id: str
+    member_id: str
+    quantity: int
+    price_per_share: float
+    total_amount: float
+    payment_method: str  # mpesa, bank_transfer, cash, group_balance
+    transaction_reference: Optional[str] = None
+    notes: Optional[str] = None
+
+class ShareTransferCreate(BaseModel):
+    chama_id: str
+    from_member_id: str
+    to_member_id: str
+    quantity: int
+    price_per_share: Optional[float] = None
+    total_amount: Optional[float] = None
+    reason: Optional[str] = None
+    notes: Optional[str] = None
+
+class DividendDeclaration(BaseModel):
+    chama_id: str
+    total_dividend_amount: float
+    dividend_per_share: float
+    declaration_date: str
+    payment_date: str
+    financial_year: str
+    notes: Optional[str] = None
+
 # Authentication Endpoints
 @api_router.post("/auth/register")
 async def register(user: UserRegister):
@@ -3630,6 +3700,1264 @@ async def get_meeting_minutes(meeting_id: str, current_user: dict = Depends(get_
         "created_by": author_name,
         "created_at": minutes["created_at"],
         "updated_at": minutes.get("updated_at")
+    }
+
+# Welfare Fund Endpoints
+@api_router.get("/welfare/settings/{chama_id}")
+async def get_welfare_settings(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    if not chama:
+        raise HTTPException(status_code=404, detail="Chama not found")
+
+    # Get or create welfare settings
+    settings = chama.get("welfare_settings", {
+        "enabled": True,
+        "monthly_contribution": 1000,
+        "max_request_amount": 50000,
+        "approval_threshold": 0.75,
+        "processing_days": 5
+    })
+
+    return settings
+
+@api_router.put("/welfare/settings/{chama_id}")
+async def update_welfare_settings(
+    chama_id: str,
+    settings: WelfareSettingsUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can update welfare settings")
+
+    # Update settings
+    await db.chamas.update_one(
+        {"_id": ObjectId(chama_id)},
+        {"$set": {"welfare_settings": settings.dict()}}
+    )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "update_welfare_settings",
+        "details": "Updated welfare fund settings",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"message": "Welfare settings updated successfully", "settings": settings.dict()}
+
+@api_router.get("/welfare/balance/{chama_id}")
+async def get_welfare_balance(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Calculate total contributions
+    contributions = await db.welfare_contributions.find({"chama_id": chama_id}).to_list(10000)
+    total_contributions = sum(c["amount"] for c in contributions)
+
+    # Calculate total disbursements
+    disbursements = await db.welfare_requests.find({
+        "chama_id": chama_id,
+        "status": "disbursed"
+    }).to_list(10000)
+    total_disbursed = sum(d["amount"] for d in disbursements)
+
+    # Current balance
+    current_balance = total_contributions - total_disbursed
+
+    # Count members helped
+    unique_members_helped = len(set(d["member_id"] for d in disbursements))
+
+    return {
+        "current_balance": current_balance,
+        "total_contributions": total_contributions,
+        "total_disbursed": total_disbursed,
+        "members_helped": unique_members_helped,
+        "total_requests": len(disbursements)
+    }
+
+@api_router.post("/welfare/contribute/{chama_id}")
+async def make_welfare_contribution(
+    chama_id: str,
+    data: WelfareContributionCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Create contribution
+    contribution_dict = {
+        "chama_id": chama_id,
+        "member_id": str(member["_id"]),
+        "user_id": str(current_user["_id"]),
+        "amount": data.amount,
+        "contribution_date": data.contribution_date or datetime.utcnow().isoformat().split('T')[0],
+        "notes": data.notes,
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.welfare_contributions.insert_one(contribution_dict)
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "welfare_contribution",
+        "details": f"Contributed KES {data.amount} to welfare fund",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "contribution_id": str(result.inserted_id),
+        "message": "Welfare contribution recorded successfully"
+    }
+
+@api_router.get("/welfare/contributions/{chama_id}")
+async def get_welfare_contributions(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    contributions = await db.welfare_contributions.find({"chama_id": chama_id}).sort("created_at", -1).to_list(1000)
+
+    result = []
+    for c in contributions:
+        member_doc = await db.members.find_one({"_id": ObjectId(c["member_id"])})
+        member_name = "Unknown"
+        if member_doc:
+            user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        result.append({
+            "id": str(c["_id"]),
+            "member_name": member_name,
+            "amount": c["amount"],
+            "contribution_date": c["contribution_date"],
+            "notes": c.get("notes"),
+            "created_at": c["created_at"]
+        })
+
+    return result
+
+@api_router.post("/welfare/request")
+async def create_welfare_request(data: WelfareRequestCreate, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get welfare settings
+    chama = await db.chamas.find_one({"_id": ObjectId(data.chama_id)})
+    welfare_settings = chama.get("welfare_settings", {})
+    max_amount = welfare_settings.get("max_request_amount", 50000)
+
+    # Validate amount
+    if data.amount > max_amount:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Request amount exceeds maximum allowed (KES {max_amount})"
+        )
+
+    # Create request
+    request_dict = {
+        "chama_id": data.chama_id,
+        "member_id": str(member["_id"]),
+        "user_id": str(current_user["_id"]),
+        "request_type": data.request_type,
+        "amount": data.amount,
+        "reason": data.reason,
+        "description": data.description,
+        "supporting_documents": data.supporting_documents or [],
+        "status": "pending",
+        "votes_for": 0,
+        "votes_against": 0,
+        "voters": [],
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.welfare_requests.insert_one(request_dict)
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "welfare_request_created",
+        "details": f"Created {data.request_type} welfare request for KES {data.amount}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "request_id": str(result.inserted_id),
+        "message": "Welfare request submitted successfully"
+    }
+
+@api_router.get("/welfare/requests/{chama_id}")
+async def get_welfare_requests(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    requests = await db.welfare_requests.find({"chama_id": chama_id}).sort("created_at", -1).to_list(1000)
+
+    result = []
+    for r in requests:
+        member_doc = await db.members.find_one({"_id": ObjectId(r["member_id"])})
+        member_name = "Unknown"
+        if member_doc:
+            user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        result.append({
+            "id": str(r["_id"]),
+            "member_id": r["member_id"],
+            "member_name": member_name,
+            "request_type": r["request_type"],
+            "amount": r["amount"],
+            "reason": r["reason"],
+            "description": r.get("description"),
+            "status": r["status"],
+            "votes": {
+                "for": r.get("votes_for", 0),
+                "against": r.get("votes_against", 0)
+            },
+            "created_at": r["created_at"],
+            "disbursement_date": r.get("disbursement_date"),
+            "supporting_documents": r.get("supporting_documents", [])
+        })
+
+    return result
+
+@api_router.get("/welfare/request/{request_id}")
+async def get_welfare_request_details(request_id: str, current_user: dict = Depends(get_current_user)):
+    request = await db.welfare_requests.find_one({"_id": ObjectId(request_id)})
+    if not request:
+        raise HTTPException(status_code=404, detail="Welfare request not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": request["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get member details
+    member_doc = await db.members.find_one({"_id": ObjectId(request["member_id"])})
+    member_name = "Unknown"
+    if member_doc:
+        user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+        member_name = user["name"] if user else "Unknown"
+
+    return {
+        "id": str(request["_id"]),
+        "member_id": request["member_id"],
+        "member_name": member_name,
+        "request_type": request["request_type"],
+        "amount": request["amount"],
+        "reason": request["reason"],
+        "description": request.get("description"),
+        "status": request["status"],
+        "votes": {
+            "for": request.get("votes_for", 0),
+            "against": request.get("votes_against", 0)
+        },
+        "voters": request.get("voters", []),
+        "created_at": request["created_at"],
+        "updated_at": request.get("updated_at"),
+        "admin_notes": request.get("admin_notes"),
+        "disbursement_date": request.get("disbursement_date"),
+        "disbursement_method": request.get("disbursement_method"),
+        "transaction_reference": request.get("transaction_reference"),
+        "supporting_documents": request.get("supporting_documents", [])
+    }
+
+@api_router.post("/welfare/vote")
+async def vote_on_welfare_request(data: WelfareVoteCreate, current_user: dict = Depends(get_current_user)):
+    request = await db.welfare_requests.find_one({"_id": ObjectId(data.request_id)})
+    if not request:
+        raise HTTPException(status_code=404, detail="Welfare request not found")
+
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": request["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Check if already voted
+    voters = request.get("voters", [])
+    user_id_str = str(current_user["_id"])
+
+    # Find if user has already voted
+    existing_vote = None
+    for i, voter in enumerate(voters):
+        if voter["user_id"] == user_id_str:
+            existing_vote = i
+            break
+
+    # Remove previous vote if exists
+    if existing_vote is not None:
+        old_vote = voters[existing_vote]["vote"]
+        if old_vote == "approve":
+            request["votes_for"] = request.get("votes_for", 1) - 1
+        else:
+            request["votes_against"] = request.get("votes_against", 1) - 1
+        voters.pop(existing_vote)
+
+    # Add new vote
+    voters.append({
+        "user_id": user_id_str,
+        "vote": data.vote,
+        "comment": data.comment,
+        "voted_at": datetime.utcnow().isoformat()
+    })
+
+    # Update vote counts
+    if data.vote == "approve":
+        votes_for = request.get("votes_for", 0) + 1
+        votes_against = request.get("votes_against", 0)
+    else:
+        votes_for = request.get("votes_for", 0)
+        votes_against = request.get("votes_against", 0) + 1
+
+    # Update request
+    await db.welfare_requests.update_one(
+        {"_id": ObjectId(data.request_id)},
+        {"$set": {
+            "votes_for": votes_for,
+            "votes_against": votes_against,
+            "voters": voters,
+            "updated_at": datetime.utcnow().isoformat()
+        }}
+    )
+
+    # Check if approval threshold is met
+    chama = await db.chamas.find_one({"_id": ObjectId(request["chama_id"])})
+    welfare_settings = chama.get("welfare_settings", {})
+    approval_threshold = welfare_settings.get("approval_threshold", 0.75)
+
+    # Get total active members
+    total_members = await db.members.count_documents({
+        "chama_id": request["chama_id"],
+        "status": "active"
+    })
+
+    # Calculate approval percentage
+    total_votes = votes_for + votes_against
+    if total_votes >= total_members * 0.5:  # At least 50% participation
+        approval_rate = votes_for / total_votes if total_votes > 0 else 0
+
+        if approval_rate >= approval_threshold:
+            # Auto-approve
+            await db.welfare_requests.update_one(
+                {"_id": ObjectId(data.request_id)},
+                {"$set": {
+                    "status": "approved",
+                    "approved_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }}
+            )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": request["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "welfare_vote",
+        "details": f"Voted {data.vote} on welfare request",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "message": "Vote recorded successfully",
+        "votes": {
+            "for": votes_for,
+            "against": votes_against
+        }
+    }
+
+@api_router.put("/welfare/request/{request_id}")
+async def update_welfare_request(
+    request_id: str,
+    data: WelfareRequestUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    request = await db.welfare_requests.find_one({"_id": ObjectId(request_id)})
+    if not request:
+        raise HTTPException(status_code=404, detail="Welfare request not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": request["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can update welfare requests")
+
+    update_data = {"updated_at": datetime.utcnow().isoformat()}
+
+    if data.status:
+        update_data["status"] = data.status
+        if data.status == "approved":
+            update_data["approved_at"] = datetime.utcnow().isoformat()
+        elif data.status == "disbursed":
+            update_data["disbursement_date"] = data.disbursement_date or datetime.utcnow().isoformat().split('T')[0]
+            if data.disbursement_method:
+                update_data["disbursement_method"] = data.disbursement_method
+            if data.transaction_reference:
+                update_data["transaction_reference"] = data.transaction_reference
+
+    if data.admin_notes:
+        update_data["admin_notes"] = data.admin_notes
+
+    await db.welfare_requests.update_one(
+        {"_id": ObjectId(request_id)},
+        {"$set": update_data}
+    )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": request["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "welfare_request_updated",
+        "details": f"Updated welfare request status to {data.status}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"message": "Welfare request updated successfully"}
+
+@api_router.get("/welfare/analytics/{chama_id}")
+async def get_welfare_analytics(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get all requests
+    requests = await db.welfare_requests.find({"chama_id": chama_id}).to_list(10000)
+
+    # Analytics by type
+    by_type = {}
+    for r in requests:
+        req_type = r["request_type"]
+        if req_type not in by_type:
+            by_type[req_type] = {"count": 0, "total_amount": 0}
+        by_type[req_type]["count"] += 1
+        if r["status"] == "disbursed":
+            by_type[req_type]["total_amount"] += r["amount"]
+
+    # Analytics by status
+    by_status = {}
+    for r in requests:
+        status = r["status"]
+        if status not in by_status:
+            by_status[status] = 0
+        by_status[status] += 1
+
+    # Get balance info
+    contributions = await db.welfare_contributions.find({"chama_id": chama_id}).to_list(10000)
+    total_contributions = sum(c["amount"] for c in contributions)
+
+    disbursements = [r for r in requests if r["status"] == "disbursed"]
+    total_disbursed = sum(d["amount"] for d in disbursements)
+
+    return {
+        "by_type": by_type,
+        "by_status": by_status,
+        "total_requests": len(requests),
+        "total_contributions": total_contributions,
+        "total_disbursed": total_disbursed,
+        "current_balance": total_contributions - total_disbursed,
+        "members_helped": len(set(d["member_id"] for d in disbursements))
+    }
+
+@api_router.get("/welfare/disbursements/{chama_id}")
+async def get_welfare_disbursements(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    disbursements = await db.welfare_requests.find({
+        "chama_id": chama_id,
+        "status": "disbursed"
+    }).sort("disbursement_date", -1).to_list(1000)
+
+    result = []
+    for d in disbursements:
+        member_doc = await db.members.find_one({"_id": ObjectId(d["member_id"])})
+        member_name = "Unknown"
+        if member_doc:
+            user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        result.append({
+            "id": str(d["_id"]),
+            "member_name": member_name,
+            "request_type": d["request_type"],
+            "amount": d["amount"],
+            "reason": d["reason"],
+            "disbursement_date": d.get("disbursement_date"),
+            "disbursement_method": d.get("disbursement_method"),
+            "transaction_reference": d.get("transaction_reference")
+        })
+
+    return result
+
+# Share Management Endpoints
+@api_router.get("/shares/settings/{chama_id}")
+async def get_share_settings(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    if not chama:
+        raise HTTPException(status_code=404, detail="Chama not found")
+
+    share_settings = chama.get("share_settings", {})
+
+    return {
+        "enabled": share_settings.get("enabled", True),
+        "total_shares": share_settings.get("total_shares", 1000),
+        "share_price": share_settings.get("share_price", 5000.0),
+        "min_shares_per_member": share_settings.get("min_shares_per_member", 1),
+        "max_shares_per_member": share_settings.get("max_shares_per_member"),
+        "allow_share_transfer": share_settings.get("allow_share_transfer", True),
+        "total_shares_allocated": share_settings.get("total_shares_allocated", 0),
+        "total_share_capital": share_settings.get("total_share_capital", 0.0),
+        "nav_per_share": share_settings.get("nav_per_share", share_settings.get("share_price", 5000.0))
+    }
+
+@api_router.put("/shares/settings/{chama_id}")
+async def update_share_settings(
+    chama_id: str,
+    settings: ShareSettingsUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can update share settings")
+
+    update_data = {
+        "share_settings.enabled": settings.enabled,
+        "share_settings.total_shares": settings.total_shares,
+        "share_settings.share_price": settings.share_price,
+        "share_settings.min_shares_per_member": settings.min_shares_per_member,
+        "share_settings.max_shares_per_member": settings.max_shares_per_member,
+        "share_settings.allow_share_transfer": settings.allow_share_transfer
+    }
+
+    await db.chamas.update_one(
+        {"_id": ObjectId(chama_id)},
+        {"$set": update_data}
+    )
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "update_share_settings",
+        "details": f"Updated share settings",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {"message": "Share settings updated successfully"}
+
+@api_router.post("/shares/purchase")
+async def purchase_shares(data: SharePurchaseCreate, current_user: dict = Depends(get_current_user)):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can allocate shares")
+
+    # Get chama and settings
+    chama = await db.chamas.find_one({"_id": ObjectId(data.chama_id)})
+    if not chama:
+        raise HTTPException(status_code=404, detail="Chama not found")
+
+    share_settings = chama.get("share_settings", {})
+    total_shares = share_settings.get("total_shares", 1000)
+    total_allocated = share_settings.get("total_shares_allocated", 0)
+    max_shares_per_member = share_settings.get("max_shares_per_member")
+
+    # Verify member exists
+    target_member = await db.members.find_one({
+        "_id": ObjectId(data.member_id),
+        "chama_id": data.chama_id,
+        "status": "active"
+    })
+    if not target_member:
+        raise HTTPException(status_code=404, detail="Member not found in this Chama")
+
+    # Check if enough shares available
+    if total_allocated + data.quantity > total_shares:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient shares available. Remaining: {total_shares - total_allocated}"
+        )
+
+    # Check member's current shares
+    current_member_shares = await db.share_purchases.find({
+        "chama_id": data.chama_id,
+        "member_id": data.member_id,
+        "status": "active"
+    }).to_list(1000)
+    current_quantity = sum(s.get("quantity", 0) for s in current_member_shares)
+
+    # Check max shares limit
+    if max_shares_per_member and (current_quantity + data.quantity) > max_shares_per_member:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Member cannot own more than {max_shares_per_member} shares. Currently owns: {current_quantity}"
+        )
+
+    # Create share purchase record
+    purchase_dict = {
+        "chama_id": data.chama_id,
+        "member_id": data.member_id,
+        "quantity": data.quantity,
+        "price_per_share": data.price_per_share,
+        "total_amount": data.total_amount,
+        "payment_method": data.payment_method,
+        "transaction_reference": data.transaction_reference,
+        "notes": data.notes,
+        "status": "active",
+        "purchase_date": datetime.utcnow().isoformat().split('T')[0],
+        "allocated_by": str(current_user["_id"]),
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.share_purchases.insert_one(purchase_dict)
+
+    # Update chama share allocation
+    await db.chamas.update_one(
+        {"_id": ObjectId(data.chama_id)},
+        {
+            "$inc": {
+                "share_settings.total_shares_allocated": data.quantity,
+                "share_settings.total_share_capital": data.total_amount
+            }
+        }
+    )
+
+    # Get member details for logging
+    user = await db.users.find_one({"_id": ObjectId(target_member["user_id"])})
+    member_name = user["name"] if user else "Unknown"
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "allocate_shares",
+        "details": f"Allocated {data.quantity} shares to {member_name} for KES {data.total_amount:,.2f}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "purchase_id": str(result.inserted_id),
+        "message": "Shares purchased successfully"
+    }
+
+@api_router.get("/shares/purchases/{chama_id}")
+async def get_share_purchases(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    purchases = await db.share_purchases.find({
+        "chama_id": chama_id,
+        "status": "active"
+    }).sort("purchase_date", -1).to_list(1000)
+
+    result = []
+    for purchase in purchases:
+        # Get member details
+        member_doc = await db.members.find_one({"_id": ObjectId(purchase["member_id"])})
+        member_name = "Unknown"
+        if member_doc:
+            user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        result.append({
+            "id": str(purchase["_id"]),
+            "member_id": purchase["member_id"],
+            "member_name": member_name,
+            "quantity": purchase["quantity"],
+            "price_per_share": purchase["price_per_share"],
+            "total_amount": purchase["total_amount"],
+            "payment_method": purchase["payment_method"],
+            "transaction_reference": purchase.get("transaction_reference"),
+            "purchase_date": purchase["purchase_date"],
+            "notes": purchase.get("notes"),
+            "created_at": purchase["created_at"]
+        })
+
+    return result
+
+@api_router.get("/shares/shareholders/{chama_id}")
+async def get_shareholders(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get all active members
+    members = await db.members.find({
+        "chama_id": chama_id,
+        "status": "active"
+    }).to_list(1000)
+
+    # Get share settings
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    share_settings = chama.get("share_settings", {})
+    total_shares = share_settings.get("total_shares_allocated", 0)
+    share_price = share_settings.get("share_price", 5000.0)
+    nav_per_share = share_settings.get("nav_per_share", share_price)
+
+    result = []
+    for m in members:
+        # Get member's shares
+        purchases = await db.share_purchases.find({
+            "chama_id": chama_id,
+            "member_id": str(m["_id"]),
+            "status": "active"
+        }).to_list(1000)
+
+        member_shares = sum(p.get("quantity", 0) for p in purchases)
+
+        if member_shares > 0:
+            # Get user details
+            user = await db.users.find_one({"_id": ObjectId(m["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+            profile_picture = user.get("profile_picture") if user else None
+
+            percentage = (member_shares / total_shares * 100) if total_shares > 0 else 0
+            current_value = member_shares * nav_per_share
+            total_invested = sum(p.get("total_amount", 0) for p in purchases)
+
+            result.append({
+                "member_id": str(m["_id"]),
+                "user_id": str(m["user_id"]),
+                "name": member_name,
+                "profile_picture": profile_picture,
+                "shares": member_shares,
+                "percentage": round(percentage, 2),
+                "total_invested": total_invested,
+                "current_value": current_value,
+                "unrealized_gain": current_value - total_invested
+            })
+
+    # Sort by shares descending
+    result.sort(key=lambda x: x["shares"], reverse=True)
+
+    return result
+
+@api_router.get("/shares/my-shares/{chama_id}")
+async def get_my_shares(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get my share purchases
+    purchases = await db.share_purchases.find({
+        "chama_id": chama_id,
+        "member_id": str(member["_id"]),
+        "status": "active"
+    }).to_list(1000)
+
+    total_shares = sum(p.get("quantity", 0) for p in purchases)
+    total_invested = sum(p.get("total_amount", 0) for p in purchases)
+
+    # Get chama settings
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    share_settings = chama.get("share_settings", {})
+    chama_total_shares = share_settings.get("total_shares_allocated", 0)
+    nav_per_share = share_settings.get("nav_per_share", share_settings.get("share_price", 5000.0))
+
+    current_value = total_shares * nav_per_share
+    percentage = (total_shares / chama_total_shares * 100) if chama_total_shares > 0 else 0
+
+    # Get dividend history
+    dividends = await db.dividends.find({
+        "chama_id": chama_id,
+        f"distributions.{str(member['_id'])}": {"$exists": True}
+    }).sort("declaration_date", -1).to_list(100)
+
+    total_dividends_received = 0
+    dividend_history = []
+
+    for div in dividends:
+        distributions = div.get("distributions", {})
+        member_distribution = distributions.get(str(member["_id"]), {})
+        amount = member_distribution.get("amount", 0)
+        total_dividends_received += amount
+
+        dividend_history.append({
+            "id": str(div["_id"]),
+            "declaration_date": div["declaration_date"],
+            "payment_date": div["payment_date"],
+            "dividend_per_share": div["dividend_per_share"],
+            "shares_held": member_distribution.get("shares_held", 0),
+            "amount_received": amount,
+            "status": member_distribution.get("status", "pending")
+        })
+
+    return {
+        "total_shares": total_shares,
+        "total_invested": total_invested,
+        "current_value": current_value,
+        "unrealized_gain": current_value - total_invested,
+        "roi_percentage": ((current_value - total_invested) / total_invested * 100) if total_invested > 0 else 0,
+        "ownership_percentage": round(percentage, 2),
+        "total_dividends_received": total_dividends_received,
+        "purchases": [
+            {
+                "id": str(p["_id"]),
+                "quantity": p["quantity"],
+                "price_per_share": p["price_per_share"],
+                "total_amount": p["total_amount"],
+                "purchase_date": p["purchase_date"],
+                "payment_method": p["payment_method"],
+                "transaction_reference": p.get("transaction_reference"),
+                "notes": p.get("notes")
+            }
+            for p in purchases
+        ],
+        "dividend_history": dividend_history
+    }
+
+@api_router.post("/shares/transfer")
+async def transfer_shares(data: ShareTransferCreate, current_user: dict = Depends(get_current_user)):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can facilitate share transfers")
+
+    # Check if transfers are allowed
+    chama = await db.chamas.find_one({"_id": ObjectId(data.chama_id)})
+    share_settings = chama.get("share_settings", {})
+    if not share_settings.get("allow_share_transfer", True):
+        raise HTTPException(status_code=400, detail="Share transfers are not allowed for this Chama")
+
+    # Verify both members exist
+    from_member = await db.members.find_one({
+        "_id": ObjectId(data.from_member_id),
+        "chama_id": data.chama_id,
+        "status": "active"
+    })
+    to_member = await db.members.find_one({
+        "_id": ObjectId(data.to_member_id),
+        "chama_id": data.chama_id,
+        "status": "active"
+    })
+
+    if not from_member or not to_member:
+        raise HTTPException(status_code=404, detail="One or both members not found")
+
+    # Check if from_member has enough shares
+    from_purchases = await db.share_purchases.find({
+        "chama_id": data.chama_id,
+        "member_id": data.from_member_id,
+        "status": "active"
+    }).to_list(1000)
+    from_shares = sum(p.get("quantity", 0) for p in from_purchases)
+
+    if from_shares < data.quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient shares. Member has {from_shares} shares, trying to transfer {data.quantity}"
+        )
+
+    # Create transfer record
+    transfer_dict = {
+        "chama_id": data.chama_id,
+        "from_member_id": data.from_member_id,
+        "to_member_id": data.to_member_id,
+        "quantity": data.quantity,
+        "price_per_share": data.price_per_share,
+        "total_amount": data.total_amount,
+        "reason": data.reason,
+        "notes": data.notes,
+        "transfer_date": datetime.utcnow().isoformat().split('T')[0],
+        "processed_by": str(current_user["_id"]),
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.share_transfers.insert_one(transfer_dict)
+
+    # Deduct from sender - mark oldest purchases as transferred
+    remaining_to_transfer = data.quantity
+    for purchase in sorted(from_purchases, key=lambda x: x["purchase_date"]):
+        if remaining_to_transfer <= 0:
+            break
+
+        purchase_qty = purchase.get("quantity", 0)
+        if purchase_qty <= remaining_to_transfer:
+            # Transfer entire purchase
+            await db.share_purchases.update_one(
+                {"_id": purchase["_id"]},
+                {"$set": {"status": "transferred", "transferred_to": data.to_member_id, "transfer_id": str(result.inserted_id)}}
+            )
+            remaining_to_transfer -= purchase_qty
+        else:
+            # Partial transfer - split the purchase
+            transfer_qty = remaining_to_transfer
+            keep_qty = purchase_qty - transfer_qty
+
+            # Update original purchase to reduce quantity
+            await db.share_purchases.update_one(
+                {"_id": purchase["_id"]},
+                {"$set": {"quantity": keep_qty}}
+            )
+
+            # Create transferred portion
+            transferred_purchase = purchase.copy()
+            transferred_purchase["_id"] = ObjectId()
+            transferred_purchase["quantity"] = transfer_qty
+            transferred_purchase["status"] = "transferred"
+            transferred_purchase["transferred_to"] = data.to_member_id
+            transferred_purchase["transfer_id"] = str(result.inserted_id)
+            await db.share_purchases.insert_one(transferred_purchase)
+
+            remaining_to_transfer = 0
+
+    # Add to receiver - create new purchase record
+    new_purchase = {
+        "chama_id": data.chama_id,
+        "member_id": data.to_member_id,
+        "quantity": data.quantity,
+        "price_per_share": data.price_per_share or share_settings.get("share_price", 5000.0),
+        "total_amount": data.total_amount or (data.quantity * share_settings.get("share_price", 5000.0)),
+        "payment_method": "transfer",
+        "transaction_reference": f"TRANSFER-{str(result.inserted_id)[:8]}",
+        "notes": f"Received via transfer from member {data.from_member_id}",
+        "status": "active",
+        "purchase_date": datetime.utcnow().isoformat().split('T')[0],
+        "allocated_by": str(current_user["_id"]),
+        "transfer_id": str(result.inserted_id),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.share_purchases.insert_one(new_purchase)
+
+    # Get member names for logging
+    from_user = await db.users.find_one({"_id": ObjectId(from_member["user_id"])})
+    to_user = await db.users.find_one({"_id": ObjectId(to_member["user_id"])})
+    from_name = from_user["name"] if from_user else "Unknown"
+    to_name = to_user["name"] if to_user else "Unknown"
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "transfer_shares",
+        "details": f"Transferred {data.quantity} shares from {from_name} to {to_name}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "transfer_id": str(result.inserted_id),
+        "message": "Shares transferred successfully"
+    }
+
+@api_router.get("/shares/transfers/{chama_id}")
+async def get_share_transfers(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    transfers = await db.share_transfers.find({
+        "chama_id": chama_id
+    }).sort("transfer_date", -1).to_list(1000)
+
+    result = []
+    for transfer in transfers:
+        # Get member details
+        from_member = await db.members.find_one({"_id": ObjectId(transfer["from_member_id"])})
+        to_member = await db.members.find_one({"_id": ObjectId(transfer["to_member_id"])})
+
+        from_name = "Unknown"
+        to_name = "Unknown"
+
+        if from_member:
+            from_user = await db.users.find_one({"_id": ObjectId(from_member["user_id"])})
+            from_name = from_user["name"] if from_user else "Unknown"
+
+        if to_member:
+            to_user = await db.users.find_one({"_id": ObjectId(to_member["user_id"])})
+            to_name = to_user["name"] if to_user else "Unknown"
+
+        result.append({
+            "id": str(transfer["_id"]),
+            "from_member_id": transfer["from_member_id"],
+            "from_member_name": from_name,
+            "to_member_id": transfer["to_member_id"],
+            "to_member_name": to_name,
+            "quantity": transfer["quantity"],
+            "price_per_share": transfer.get("price_per_share"),
+            "total_amount": transfer.get("total_amount"),
+            "transfer_date": transfer["transfer_date"],
+            "reason": transfer.get("reason"),
+            "notes": transfer.get("notes"),
+            "created_at": transfer["created_at"]
+        })
+
+    return result
+
+@api_router.post("/shares/declare-dividend")
+async def declare_dividend(data: DividendDeclaration, current_user: dict = Depends(get_current_user)):
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can declare dividends")
+
+    # Get all shareholders
+    shareholders = await get_shareholders(data.chama_id, current_user)
+
+    # Calculate distributions
+    distributions = {}
+    for shareholder in shareholders:
+        member_id = shareholder["member_id"]
+        shares = shareholder["shares"]
+        amount = shares * data.dividend_per_share
+
+        distributions[member_id] = {
+            "shares_held": shares,
+            "amount": amount,
+            "status": "pending"
+        }
+
+    # Create dividend record
+    dividend_dict = {
+        "chama_id": data.chama_id,
+        "total_dividend_amount": data.total_dividend_amount,
+        "dividend_per_share": data.dividend_per_share,
+        "declaration_date": data.declaration_date,
+        "payment_date": data.payment_date,
+        "financial_year": data.financial_year,
+        "notes": data.notes,
+        "distributions": distributions,
+        "declared_by": str(current_user["_id"]),
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    result = await db.dividends.insert_one(dividend_dict)
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": data.chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "declare_dividend",
+        "details": f"Declared dividend of KES {data.dividend_per_share:,.2f} per share (Total: KES {data.total_dividend_amount:,.2f})",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "dividend_id": str(result.inserted_id),
+        "message": "Dividend declared successfully",
+        "distributions_count": len(distributions)
+    }
+
+@api_router.get("/shares/dividends/{chama_id}")
+async def get_dividends(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    dividends = await db.dividends.find({
+        "chama_id": chama_id
+    }).sort("declaration_date", -1).to_list(100)
+
+    result = []
+    for div in dividends:
+        result.append({
+            "id": str(div["_id"]),
+            "total_dividend_amount": div["total_dividend_amount"],
+            "dividend_per_share": div["dividend_per_share"],
+            "declaration_date": div["declaration_date"],
+            "payment_date": div["payment_date"],
+            "financial_year": div["financial_year"],
+            "notes": div.get("notes"),
+            "distributions_count": len(div.get("distributions", {})),
+            "created_at": div["created_at"]
+        })
+
+    return result
+
+@api_router.get("/shares/analytics/{chama_id}")
+async def get_share_analytics(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get chama and settings
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    share_settings = chama.get("share_settings", {})
+
+    # Get all purchases
+    purchases = await db.share_purchases.find({
+        "chama_id": chama_id,
+        "status": "active"
+    }).to_list(10000)
+
+    # Get all dividends
+    dividends = await db.dividends.find({"chama_id": chama_id}).to_list(1000)
+
+    total_shares_allocated = sum(p.get("quantity", 0) for p in purchases)
+    total_share_capital = sum(p.get("total_amount", 0) for p in purchases)
+    total_dividends_paid = sum(d.get("total_dividend_amount", 0) for d in dividends)
+
+    # Calculate NAV
+    # Get chama balance
+    contributions = await db.contributions.find({
+        "chama_id": chama_id,
+        "status": "paid"
+    }).to_list(10000)
+    total_contributions = sum(c["amount"] for c in contributions)
+
+    loans = await db.loans.find({
+        "chama_id": chama_id,
+        "status": "approved"
+    }).to_list(10000)
+    total_loans = sum(l["amount"] for l in loans)
+
+    repayments = await db.repayments.find({}).to_list(10000)
+    loan_ids = [str(l["_id"]) for l in loans]
+    total_repaid = sum(r["amount"] for r in repayments if r["loan_id"] in loan_ids)
+
+    # Get investments
+    investments = await db.investments.find({"chama_id": chama_id}).to_list(1000)
+    total_investment_value = sum(inv["current_value"] for inv in investments)
+
+    net_asset_value = total_contributions - total_loans + total_repaid + total_investment_value - total_dividends_paid
+    nav_per_share = (net_asset_value / total_shares_allocated) if total_shares_allocated > 0 else share_settings.get("share_price", 5000.0)
+
+    # Update NAV in chama settings
+    await db.chamas.update_one(
+        {"_id": ObjectId(chama_id)},
+        {"$set": {"share_settings.nav_per_share": nav_per_share}}
+    )
+
+    # Count shareholders
+    unique_shareholders = set(p["member_id"] for p in purchases)
+
+    return {
+        "total_shares": share_settings.get("total_shares", 1000),
+        "total_shares_allocated": total_shares_allocated,
+        "total_shares_available": share_settings.get("total_shares", 1000) - total_shares_allocated,
+        "allocation_percentage": (total_shares_allocated / share_settings.get("total_shares", 1000) * 100) if share_settings.get("total_shares", 1000) > 0 else 0,
+        "total_shareholders": len(unique_shareholders),
+        "total_share_capital": total_share_capital,
+        "share_price": share_settings.get("share_price", 5000.0),
+        "net_asset_value": net_asset_value,
+        "nav_per_share": nav_per_share,
+        "nav_growth": ((nav_per_share - share_settings.get("share_price", 5000.0)) / share_settings.get("share_price", 5000.0) * 100) if share_settings.get("share_price", 5000.0) > 0 else 0,
+        "total_dividends_declared": len(dividends),
+        "total_dividends_paid": total_dividends_paid
     }
 
 app.include_router(api_router)
