@@ -3939,6 +3939,12 @@ async def get_welfare_requests(chama_id: str, current_user: dict = Depends(get_c
     if not member:
         raise HTTPException(status_code=403, detail="Not a member of this Chama")
 
+    # Get total active members count for participation calculation
+    total_members = await db.members.count_documents({
+        "chama_id": chama_id,
+        "status": "active"
+    })
+
     requests = await db.welfare_requests.find({"chama_id": chama_id}).sort("created_at", -1).to_list(1000)
 
     result = []
@@ -3953,6 +3959,7 @@ async def get_welfare_requests(chama_id: str, current_user: dict = Depends(get_c
             "id": str(r["_id"]),
             "member_id": r["member_id"],
             "member_name": member_name,
+            "user_id": r["user_id"],
             "request_type": r["request_type"],
             "amount": r["amount"],
             "reason": r["reason"],
@@ -3962,6 +3969,8 @@ async def get_welfare_requests(chama_id: str, current_user: dict = Depends(get_c
                 "for": r.get("votes_for", 0),
                 "against": r.get("votes_against", 0)
             },
+            "voters": r.get("voters", []),
+            "total_members": total_members,
             "created_at": r["created_at"],
             "disbursement_date": r.get("disbursement_date"),
             "supporting_documents": r.get("supporting_documents", [])
@@ -4028,6 +4037,10 @@ async def vote_on_welfare_request(data: WelfareVoteCreate, current_user: dict = 
     })
     if not member:
         raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Prevent voting on own request
+    if request["user_id"] == str(current_user["_id"]):
+        raise HTTPException(status_code=403, detail="You cannot vote on your own welfare request")
 
     # Check if already voted
     voters = request.get("voters", [])
