@@ -1551,10 +1551,11 @@ async def get_dashboard(chama_id: str, current_user: dict = Depends(get_current_
     
     loans = await db.loans.find({"chama_id": chama_id, "status": "approved"}).to_list(10000)
     total_loans_issued = sum(l["amount"] for l in loans)
-    
-    repayments = await db.repayments.find({}).to_list(10000)
+
+    # Optimized: Filter repayments by loan_ids directly in MongoDB
     loan_ids = [str(l["_id"]) for l in loans]
-    total_repaid = sum(r["amount"] for r in repayments if r["loan_id"] in loan_ids)
+    repayments = await db.repayments.find({"loan_id": {"$in": loan_ids}}).to_list(10000) if loan_ids else []
+    total_repaid = sum(r["amount"] for r in repayments)
     
     # Get total merry-go-round disbursements (balance-funded only)
     mgr_disbursements = await db.merry_go_round_disbursements.find({"chama_id": chama_id}).to_list(10000)
@@ -1573,6 +1574,432 @@ async def get_dashboard(chama_id: str, current_user: dict = Depends(get_current_
         "outstanding_loans": outstanding_loans,
         "current_balance": current_balance,
         "member_count": member_count
+    }
+
+# Reports & Analytics Endpoints
+@api_router.get("/reports/analytics/{chama_id}")
+async def get_reports_analytics(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get all data for analytics
+    contributions = await db.contributions.find({"chama_id": chama_id}).to_list(10000)
+    loans = await db.loans.find({"chama_id": chama_id}).to_list(10000)
+    members_list = await db.members.find({"chama_id": chama_id, "status": "active"}).to_list(10000)
+
+    # Calculate key metrics
+    total_contributions = sum(c["amount"] for c in contributions if c["status"] == "paid")
+    pending_contributions = sum(c["amount"] for c in contributions if c["status"] in ["pending", "pending_verification"])
+
+    approved_loans = [l for l in loans if l["status"] == "approved"]
+    total_loans_issued = sum(l["amount"] for l in approved_loans)
+
+    # Optimized: Filter repayments by loan_ids directly in MongoDB
+    loan_ids = [str(l["_id"]) for l in approved_loans]
+    repayments = await db.repayments.find({"loan_id": {"$in": loan_ids}}).to_list(10000) if loan_ids else []
+    total_repaid = sum(r["amount"] for r in repayments)
+    outstanding_loans = total_loans_issued - total_repaid
+
+    # Calculate rates
+    total_expected = total_contributions + pending_contributions
+    contribution_rate = (total_contributions / total_expected * 100) if total_expected > 0 else 0
+    default_rate = (outstanding_loans / total_loans_issued * 100) if total_loans_issued > 0 else 0
+
+    # Member participation
+    active_members = len([m for m in members_list])
+    contributing_members = len(set([c["member_id"] for c in contributions if c["status"] == "paid"]))
+
+    # Monthly growth - compare last 2 months
+    now = datetime.utcnow()
+    current_month_start = datetime(now.year, now.month, 1).isoformat()
+
+    if now.month == 1:
+        prev_month_start = datetime(now.year - 1, 12, 1).isoformat()
+        prev_month_end = datetime(now.year, 1, 1).isoformat()
+    else:
+        prev_month_start = datetime(now.year, now.month - 1, 1).isoformat()
+        prev_month_end = current_month_start
+
+    current_month_contrib = sum(c["amount"] for c in contributions
+                                if c["status"] == "paid" and c.get("paid_date", "") >= current_month_start)
+    prev_month_contrib = sum(c["amount"] for c in contributions
+                            if c["status"] == "paid"
+                            and c.get("paid_date", "") >= prev_month_start
+                            and c.get("paid_date", "") < prev_month_end)
+
+    monthly_growth = ((current_month_contrib - prev_month_contrib) / prev_month_contrib * 100) if prev_month_contrib > 0 else 0
+
+    # Contribution trends (last 6 months)
+    trends = []
+    for i in range(5, -1, -1):
+        if now.month - i > 0:
+            month = now.month - i
+            year = now.year
+        else:
+            month = 12 + (now.month - i)
+            year = now.year - 1
+
+        month_start = datetime(year, month, 1).isoformat()
+        if month == 12:
+            month_end = datetime(year + 1, 1, 1).isoformat()
+        else:
+            month_end = datetime(year, month + 1, 1).isoformat()
+
+        month_total = sum(c["amount"] for c in contributions
+                         if c["status"] == "paid"
+                         and c.get("paid_date", "") >= month_start
+                         and c.get("paid_date", "") < month_end)
+
+        month_name = calendar.month_abbr[month]
+        trends.append({"month": month_name, "amount": month_total})
+
+    # Loan status distribution
+    pending_loans = len([l for l in loans if l["status"] == "pending"])
+    approved_loan_count = len(approved_loans)
+    rejected_loans = len([l for l in loans if l["status"] == "rejected"])
+
+    # Advanced SACCO KPIs
+    current_balance = total_contributions - total_loans_issued + total_repaid
+
+    # Loan-to-Share Ratio (should be < 100% for healthy SACCO)
+    loan_to_share_ratio = (total_loans_issued / total_contributions * 100) if total_contributions > 0 else 0
+
+    # Portfolio at Risk (PAR) - percentage of outstanding loans
+    portfolio_at_risk = (outstanding_loans / total_loans_issued * 100) if total_loans_issued > 0 else 0
+
+    # Return on Assets (ROA) - simplified: interest earned / total assets
+    total_interest_earned = sum(l["amount"] * (l.get("interest_rate", 0) / 100) for l in approved_loans)
+    total_assets = current_balance + outstanding_loans
+    return_on_assets = (total_interest_earned / total_assets * 100) if total_assets > 0 else 0
+
+    # Operating Efficiency Ratio - contributions per active member
+    avg_contribution_per_member = total_contributions / active_members if active_members > 0 else 0
+
+    # Capital Adequacy - current balance as % of total loans
+    capital_adequacy_ratio = (current_balance / total_loans_issued * 100) if total_loans_issued > 0 else 100
+
+    # Member Growth Rate (year-over-year) - simplified: current members
+    member_growth_rate = 0  # Placeholder - would need historical data
+
+    # Loan Approval Rate
+    total_loan_applications = len(loans)
+    loan_approval_rate = (approved_loan_count / total_loan_applications * 100) if total_loan_applications > 0 else 0
+
+    return {
+        "key_metrics": {
+            "contribution_rate": round(contribution_rate, 1),
+            "default_rate": round(default_rate, 1),
+            "active_members": active_members,
+            "contributing_members": contributing_members,
+            "monthly_growth": round(monthly_growth, 1)
+        },
+        "advanced_metrics": {
+            "loan_to_share_ratio": round(loan_to_share_ratio, 1),
+            "portfolio_at_risk": round(portfolio_at_risk, 1),
+            "return_on_assets": round(return_on_assets, 2),
+            "avg_contribution_per_member": round(avg_contribution_per_member, 2),
+            "capital_adequacy_ratio": round(capital_adequacy_ratio, 1),
+            "loan_approval_rate": round(loan_approval_rate, 1),
+            "total_interest_earned": round(total_interest_earned, 2)
+        },
+        "financial_summary": {
+            "total_contributions": total_contributions,
+            "pending_contributions": pending_contributions,
+            "total_loans_issued": total_loans_issued,
+            "outstanding_loans": outstanding_loans,
+            "total_repaid": total_repaid,
+            "current_balance": current_balance
+        },
+        "contribution_trends": trends,
+        "loan_distribution": {
+            "pending": pending_loans,
+            "approved": approved_loan_count,
+            "rejected": rejected_loans
+        }
+    }
+
+@api_router.get("/reports/member-statement/{chama_id}/{member_id}")
+async def get_member_statement(chama_id: str, member_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    current_member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not current_member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Admin can view all, members can only view their own
+    if current_member["role"] != "admin" and str(current_member["_id"]) != member_id:
+        raise HTTPException(status_code=403, detail="You can only view your own statement")
+
+    # Get member details
+    target_member = await db.members.find_one({"_id": ObjectId(member_id)})
+    if not target_member or target_member["chama_id"] != chama_id:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    user = await db.users.find_one({"_id": ObjectId(target_member["user_id"])})
+
+    # Get contributions
+    contributions = await db.contributions.find({
+        "chama_id": chama_id,
+        "member_id": member_id
+    }).sort("due_date", -1).to_list(1000)
+
+    contributions_list = []
+    for c in contributions:
+        contributions_list.append({
+            "id": str(c["_id"]),
+            "amount": c["amount"],
+            "due_date": c["due_date"],
+            "paid_date": c.get("paid_date"),
+            "status": c["status"],
+            "is_arrears": c.get("is_arrears", False)
+        })
+
+    # Get loans
+    loans = await db.loans.find({
+        "chama_id": chama_id,
+        "member_id": member_id
+    }).sort("created_at", -1).to_list(1000)
+
+    loans_list = []
+    for l in loans:
+        repayments = await db.repayments.find({"loan_id": str(l["_id"])}).to_list(1000)
+        total_repaid = sum(r["amount"] for r in repayments)
+
+        loans_list.append({
+            "id": str(l["_id"]),
+            "amount": l["amount"],
+            "status": l["status"],
+            "interest_rate": l["interest_rate"],
+            "outstanding_balance": l.get("outstanding_balance", l["amount"]),
+            "total_repaid": total_repaid,
+            "created_at": l["created_at"],
+            "approved_date": l.get("approved_date")
+        })
+
+    # Calculate totals
+    total_contributed = sum(c["amount"] for c in contributions if c["status"] == "paid")
+    total_pending = sum(c["amount"] for c in contributions if c["status"] in ["pending", "pending_verification"])
+    total_borrowed = sum(l["amount"] for l in loans if l["status"] == "approved")
+    # Fix: Calculate total repaid correctly from the loans_list we already built
+    total_loan_repaid = sum(loan["total_repaid"] for loan in loans_list if loan["status"] == "approved")
+
+    return {
+        "member": {
+            "id": str(target_member["_id"]),
+            "name": user["name"],
+            "phone": user["phone"],
+            "role": target_member["role"],
+            "joined_at": target_member["joined_at"]
+        },
+        "summary": {
+            "total_contributed": total_contributed,
+            "total_pending": total_pending,
+            "total_borrowed": total_borrowed,
+            "total_loan_repaid": total_loan_repaid,
+            "net_position": total_contributed - total_borrowed + total_loan_repaid
+        },
+        "contributions": contributions_list,
+        "loans": loans_list
+    }
+
+@api_router.get("/reports/contribution-summary/{chama_id}")
+async def get_contribution_summary(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get all members and their contributions
+    members_list = await db.members.find({"chama_id": chama_id, "status": "active"}).to_list(1000)
+    contributions = await db.contributions.find({"chama_id": chama_id}).to_list(10000)
+
+    summary = []
+    for m in members_list:
+        user = await db.users.find_one({"_id": ObjectId(m["user_id"])})
+        member_id = str(m["_id"])
+
+        member_contributions = [c for c in contributions if c["member_id"] == member_id]
+
+        total_paid = sum(c["amount"] for c in member_contributions if c["status"] == "paid")
+        total_pending = sum(c["amount"] for c in member_contributions if c["status"] in ["pending", "pending_verification"])
+        total_expected = total_paid + total_pending
+
+        compliance_rate = (total_paid / total_expected * 100) if total_expected > 0 else 0
+
+        summary.append({
+            "member_id": member_id,
+            "name": user["name"] if user else "Unknown",
+            "total_paid": total_paid,
+            "total_pending": total_pending,
+            "total_expected": total_expected,
+            "compliance_rate": round(compliance_rate, 1),
+            "arrears": total_pending
+        })
+
+    # Sort by compliance rate descending
+    summary.sort(key=lambda x: x["compliance_rate"], reverse=True)
+
+    return {
+        "members": summary,
+        "totals": {
+            "total_collected": sum(s["total_paid"] for s in summary),
+            "total_pending": sum(s["total_pending"] for s in summary),
+            "average_compliance": round(sum(s["compliance_rate"] for s in summary) / len(summary), 1) if summary else 0
+        }
+    }
+
+@api_router.get("/reports/loan-portfolio/{chama_id}")
+async def get_loan_portfolio(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    loans = await db.loans.find({"chama_id": chama_id}).to_list(10000)
+
+    portfolio = []
+    for l in loans:
+        # Get member details
+        loan_member = await db.members.find_one({"_id": ObjectId(l["member_id"])})
+        member_name = "Unknown"
+        if loan_member:
+            user = await db.users.find_one({"_id": ObjectId(loan_member["user_id"])})
+            member_name = user["name"] if user else "Unknown"
+
+        # Get repayments
+        repayments = await db.repayments.find({"loan_id": str(l["_id"])}).to_list(1000)
+        total_repaid = sum(r["amount"] for r in repayments)
+
+        repayment_rate = (total_repaid / l["amount"] * 100) if l["amount"] > 0 else 0
+
+        portfolio.append({
+            "loan_id": str(l["_id"]),
+            "member_name": member_name,
+            "amount": l["amount"],
+            "interest_rate": l["interest_rate"],
+            "status": l["status"],
+            "outstanding_balance": l.get("outstanding_balance", l["amount"]),
+            "total_repaid": total_repaid,
+            "repayment_rate": round(repayment_rate, 1),
+            "created_at": l["created_at"],
+            "approved_date": l.get("approved_date")
+        })
+
+    # Calculate totals
+    approved_loans = [l for l in portfolio if l["status"] == "approved"]
+    total_issued = sum(l["amount"] for l in approved_loans)
+    total_repaid_all = sum(l["total_repaid"] for l in approved_loans)
+    total_outstanding = sum(l["outstanding_balance"] for l in approved_loans)
+
+    return {
+        "loans": portfolio,
+        "summary": {
+            "total_loans": len(loans),
+            "approved_loans": len(approved_loans),
+            "pending_loans": len([l for l in loans if l["status"] == "pending"]),
+            "total_issued": total_issued,
+            "total_repaid": total_repaid_all,
+            "total_outstanding": total_outstanding,
+            "portfolio_at_risk": round((total_outstanding / total_issued * 100) if total_issued > 0 else 0, 1)
+        }
+    }
+
+@api_router.get("/reports/financial-statement/{chama_id}")
+async def get_financial_statement(chama_id: str, current_user: dict = Depends(get_current_user)):
+    # Verify membership
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of this Chama")
+
+    # Get all financial data
+    contributions = await db.contributions.find({"chama_id": chama_id}).to_list(10000)
+    loans = await db.loans.find({"chama_id": chama_id, "status": "approved"}).to_list(10000)
+
+    # Optimized: Filter repayments by loan_ids directly in MongoDB
+    loan_ids = [str(l["_id"]) for l in loans]
+    repayments = await db.repayments.find({"loan_id": {"$in": loan_ids}}).to_list(10000) if loan_ids else []
+
+    # Assets
+    cash_from_contributions = sum(c["amount"] for c in contributions if c["status"] == "paid")
+    cash_from_repayments = sum(r["amount"] for r in repayments)
+    total_cash = cash_from_contributions + cash_from_repayments
+
+    loans_receivable = sum(l.get("outstanding_balance", l["amount"]) for l in loans)
+    total_assets = total_cash + loans_receivable - sum(l["amount"] for l in loans)  # Adjust for loans issued
+
+    # Liabilities (member equity/contributions)
+    member_equity = cash_from_contributions
+    retained_earnings = cash_from_repayments - cash_from_contributions  # Interest earned
+
+    total_equity = member_equity + retained_earnings
+
+    # Income Statement
+    interest_income = sum(l["amount"] * (l["interest_rate"] / 100) for l in loans)
+    total_income = interest_income
+
+    # Expenses (simplified - could include admin costs, etc.)
+    operating_expenses = 0  # Placeholder
+    net_income = total_income - operating_expenses
+
+    # Cash Flow
+    cash_from_operations = cash_from_contributions
+    cash_from_financing = 0
+    cash_from_investing = -sum(l["amount"] for l in loans) + cash_from_repayments
+    net_cash_flow = cash_from_operations + cash_from_financing + cash_from_investing
+
+    return {
+        "balance_sheet": {
+            "assets": {
+                "current_assets": {
+                    "cash": total_cash - sum(l["amount"] for l in loans) + cash_from_repayments,
+                    "loans_receivable": loans_receivable
+                },
+                "total_assets": total_assets + loans_receivable
+            },
+            "equity": {
+                "member_contributions": member_equity,
+                "retained_earnings": retained_earnings,
+                "total_equity": total_equity + retained_earnings
+            }
+        },
+        "income_statement": {
+            "revenue": {
+                "interest_income": interest_income,
+                "total_revenue": total_income
+            },
+            "expenses": {
+                "operating_expenses": operating_expenses,
+                "total_expenses": operating_expenses
+            },
+            "net_income": net_income
+        },
+        "cash_flow": {
+            "operating_activities": cash_from_operations,
+            "investing_activities": cash_from_investing,
+            "financing_activities": cash_from_financing,
+            "net_cash_flow": net_cash_flow
+        }
     }
 
 # Announcements
