@@ -339,6 +339,13 @@ class WelfareVoteCreate(BaseModel):
     vote: str  # approve, reject
     comment: Optional[str] = None
 
+class WelfareDisbursementCreate(BaseModel):
+    request_id: str
+    disbursement_method: str  # mpesa, bank_transfer, cash
+    disbursement_source: str  # sacco_account, cash
+    transaction_reference: Optional[str] = None
+    notes: Optional[str] = None
+
 # Share Management Models
 class ShareSettingsUpdate(BaseModel):
     enabled: bool = True
@@ -4269,6 +4276,89 @@ async def get_welfare_disbursements(chama_id: str, current_user: dict = Depends(
         })
 
     return result
+
+@api_router.post("/welfare/disburse")
+async def disburse_welfare_funds(data: WelfareDisbursementCreate, current_user: dict = Depends(get_current_user)):
+    # Get the welfare request
+    request = await db.welfare_requests.find_one({"_id": ObjectId(data.request_id)})
+    if not request:
+        raise HTTPException(status_code=404, detail="Welfare request not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": request["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can disburse welfare funds")
+
+    # Check if request is approved
+    if request["status"] != "approved":
+        raise HTTPException(status_code=400, detail="Only approved requests can be disbursed")
+
+    # Validate disbursement source
+    if data.disbursement_source not in ["sacco_account", "cash"]:
+        raise HTTPException(status_code=400, detail="Invalid disbursement source. Must be 'sacco_account' or 'cash'")
+
+    # If disbursing from SACCO account, check balance
+    if data.disbursement_source == "sacco_account":
+        # Get current balance
+        contributions = await db.welfare_contributions.find({"chama_id": request["chama_id"]}).to_list(10000)
+        total_contributions = sum(c["amount"] for c in contributions)
+
+        disbursements = await db.welfare_requests.find({
+            "chama_id": request["chama_id"],
+            "status": "disbursed"
+        }).to_list(10000)
+        total_disbursed = sum(d["amount"] for d in disbursements)
+
+        current_balance = total_contributions - total_disbursed
+
+        if current_balance < request["amount"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient welfare fund balance. Current balance: KES {current_balance}, Required: KES {request['amount']}"
+            )
+
+    # Update request status to disbursed
+    await db.welfare_requests.update_one(
+        {"_id": ObjectId(data.request_id)},
+        {"$set": {
+            "status": "disbursed",
+            "disbursement_date": datetime.utcnow().isoformat().split('T')[0],
+            "disbursement_method": data.disbursement_method,
+            "disbursement_source": data.disbursement_source,
+            "transaction_reference": data.transaction_reference,
+            "disbursed_by": str(current_user["_id"]),
+            "disbursement_notes": data.notes,
+            "updated_at": datetime.utcnow().isoformat()
+        }}
+    )
+
+    # Get member details for logging
+    member_doc = await db.members.find_one({"_id": ObjectId(request["member_id"])})
+    member_name = "Unknown"
+    if member_doc:
+        user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+        member_name = user["name"] if user else "Unknown"
+
+    # Audit log
+    await db.audit_logs.insert_one({
+        "chama_id": request["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "action": "welfare_disbursement",
+        "details": f"Disbursed KES {request['amount']} to {member_name} from {data.disbursement_source} via {data.disbursement_method}",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+    return {
+        "message": "Welfare funds disbursed successfully",
+        "request_id": data.request_id,
+        "amount": request["amount"],
+        "disbursement_source": data.disbursement_source,
+        "disbursement_method": data.disbursement_method
+    }
 
 # Share Management Endpoints
 @api_router.get("/shares/settings/{chama_id}")
