@@ -1413,7 +1413,7 @@ async def generate_monthly_contributions(chama_id: str, current_user: dict = Dep
     # Get fine amount
     fine_amount = chama.get("fine_amount", 0.0)
 
-    # Create contributions for all members (one contribution per month - base amount only)
+    # Create contributions for all members (one contribution per month - base + penalty only)
     contributions_to_insert = []
     members_with_penalties = 0
 
@@ -1430,35 +1430,40 @@ async def generate_monthly_contributions(chama_id: str, current_user: dict = Dep
 
         has_unpaid = unpaid_contributions and len(unpaid_contributions) > 0
 
-        # Current month contribution - always just the base amount (no consolidation)
+        # Calculate amount for this month: base + penalty (if has unpaid)
+        # Previous unpaid contributions remain separate and are NOT added to this amount
+        if has_unpaid and fine_amount > 0:
+            current_month_amount = contribution_amount + fine_amount
+            total_unpaid = sum(c["amount"] for c in unpaid_contributions)
+            members_with_penalties += 1
+            penalty_info = {
+                "has_penalty": True,
+                "penalty_amount": fine_amount,
+                "reason": "Late payment penalty for unpaid contributions",
+                "unpaid_count": len(unpaid_contributions),
+                "total_unpaid_balance": total_unpaid,
+                "note": "Previous unpaid contributions remain separate and must be paid individually"
+            }
+        else:
+            current_month_amount = contribution_amount
+            penalty_info = {
+                "has_penalty": False,
+                "penalty_amount": 0
+            }
+
+        # Current month contribution - base amount + penalty ONLY (NO consolidation of old unpaid)
         contribution_dict = {
             "chama_id": chama_id,
             "member_id": member_id,
-            "amount": contribution_amount,
+            "amount": current_month_amount,  # Base + penalty (if applicable), NOT including old unpaid
             "due_date": due_date,
             "status": "pending",
             "paid_date": None,
             "is_historical": False,
             "auto_generated": True,
-            "created_at": datetime.utcnow().isoformat()
+            "created_at": datetime.utcnow().isoformat(),
+            "penalty_info": penalty_info
         }
-
-        # Add penalty information if member has unpaid contributions (penalty tracked separately)
-        if has_unpaid and fine_amount > 0:
-            total_unpaid = sum(c["amount"] for c in unpaid_contributions)
-            contribution_dict["penalty_info"] = {
-                "has_penalty": True,
-                "penalty_amount": fine_amount,
-                "reason": "Late payment penalty for unpaid contributions",
-                "unpaid_count": len(unpaid_contributions),
-                "total_unpaid_balance": total_unpaid
-            }
-            members_with_penalties += 1
-        else:
-            contribution_dict["penalty_info"] = {
-                "has_penalty": False,
-                "penalty_amount": 0
-            }
 
         contributions_to_insert.append(contribution_dict)
 
