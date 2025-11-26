@@ -5784,35 +5784,39 @@ async def auto_generate_contributions_task():
 
                             has_unpaid = unpaid_contributions and len(unpaid_contributions) > 0
 
-                            # Current month contribution - always just the base amount (no consolidation)
-                            contribution_dict = {
-                                "chama_id": chama_id,
-                                "member_id": member_id,
-                                "amount": contribution_amount,
-                                "due_date": due_date,
-                                "status": "pending",
-                                "paid_date": None,
-                                "is_historical": False,
-                                "auto_generated": True,
-                                "created_at": datetime.utcnow().isoformat()
-                            }
-
-                            # Add penalty information if member has unpaid contributions (penalty tracked separately)
+                            # Calculate amount for this month: base + penalty (if has unpaid)
+                            # Previous unpaid contributions remain separate and are NOT added to this amount
                             if has_unpaid and fine_amount > 0:
+                                current_month_amount = contribution_amount + fine_amount
                                 total_unpaid = sum(c["amount"] for c in unpaid_contributions)
-                                contribution_dict["penalty_info"] = {
+                                members_with_penalties += 1
+                                penalty_info = {
                                     "has_penalty": True,
                                     "penalty_amount": fine_amount,
                                     "reason": "Late payment penalty for unpaid contributions",
                                     "unpaid_count": len(unpaid_contributions),
                                     "total_unpaid_balance": total_unpaid
                                 }
-                                members_with_penalties += 1
                             else:
-                                contribution_dict["penalty_info"] = {
+                                current_month_amount = contribution_amount
+                                penalty_info = {
                                     "has_penalty": False,
                                     "penalty_amount": 0
                                 }
+
+                            # Current month contribution - base amount + penalty ONLY (NO consolidation of old unpaid)
+                            contribution_dict = {
+                                "chama_id": chama_id,
+                                "member_id": member_id,
+                                "amount": current_month_amount,  # Base + penalty (if applicable), NOT including old unpaid
+                                "due_date": due_date,
+                                "status": "pending",
+                                "paid_date": None,
+                                "is_historical": False,
+                                "auto_generated": True,
+                                "created_at": datetime.utcnow().isoformat(),
+                                "penalty_info": penalty_info
+                            }
 
                             contributions_to_insert.append(contribution_dict)
 
@@ -5921,35 +5925,39 @@ async def auto_generate_contributions_once():
 
                     has_unpaid = unpaid_contributions and len(unpaid_contributions) > 0
 
-                    # Current month contribution - always just the base amount (no consolidation)
-                    contribution_dict = {
-                        "chama_id": chama_id,
-                        "member_id": member_id,
-                        "amount": contribution_amount,
-                        "due_date": due_date,
-                        "status": "pending",
-                        "paid_date": None,
-                        "is_historical": False,
-                        "auto_generated": True,
-                        "created_at": datetime.utcnow().isoformat()
-                    }
-
-                    # Add penalty information if member has unpaid contributions (penalty tracked separately)
+                    # Calculate amount for this month: base + penalty (if has unpaid)
+                    # Previous unpaid contributions remain separate and are NOT added to this amount
                     if has_unpaid and fine_amount > 0:
+                        current_month_amount = contribution_amount + fine_amount
                         total_unpaid = sum(c["amount"] for c in unpaid_contributions)
-                        contribution_dict["penalty_info"] = {
+                        members_with_penalties += 1
+                        penalty_info = {
                             "has_penalty": True,
                             "penalty_amount": fine_amount,
                             "reason": "Late payment penalty for unpaid contributions",
                             "unpaid_count": len(unpaid_contributions),
                             "total_unpaid_balance": total_unpaid
                         }
-                        members_with_penalties += 1
                     else:
-                        contribution_dict["penalty_info"] = {
+                        current_month_amount = contribution_amount
+                        penalty_info = {
                             "has_penalty": False,
                             "penalty_amount": 0
                         }
+
+                    # Current month contribution - base amount + penalty ONLY (NO consolidation of old unpaid)
+                    contribution_dict = {
+                        "chama_id": chama_id,
+                        "member_id": member_id,
+                        "amount": current_month_amount,  # Base + penalty (if applicable), NOT including old unpaid
+                        "due_date": due_date,
+                        "status": "pending",
+                        "paid_date": None,
+                        "is_historical": False,
+                        "auto_generated": True,
+                        "created_at": datetime.utcnow().isoformat(),
+                        "penalty_info": penalty_info
+                    }
 
                     contributions_to_insert.append(contribution_dict)
 
