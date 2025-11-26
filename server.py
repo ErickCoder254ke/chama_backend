@@ -1585,7 +1585,7 @@ async def preview_monthly_contributions(chama_id: str, current_user: dict = Depe
                 "member_id": member_id,
                 "member_name": member_name,
                 "has_arrears": True,
-                "amount": contribution_amount,
+                "amount": contribution_amount + fine_amount,
                 "breakdown": {
                     "current_month_only": contribution_amount,
                     "penalty_for_late_payments": fine_amount,
