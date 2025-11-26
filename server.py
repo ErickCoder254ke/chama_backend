@@ -49,8 +49,8 @@ security = HTTPBearer()
 app = FastAPI(title="ChamaKe API", version="1.0.0")
 
 # Add GZIP compression for Render free tier
-from starlette.middleware.gzip import GZIPMiddleware
-app.add_middleware(GZIPMiddleware, minimum_size=500)
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 api_router = APIRouter(prefix="/api")
 
