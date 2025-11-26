@@ -1279,6 +1279,11 @@ async def update_auto_contribution_settings(
     if not member or member["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admins can update auto-contribution settings")
 
+    # Get current chama to preserve last run timestamp
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    if not chama:
+        raise HTTPException(status_code=404, detail="Chama not found")
+
     # Validate contribution day
     if settings.contribution_day < 1 or settings.contribution_day > 31:
         raise HTTPException(status_code=400, detail="Contribution day must be between 1 and 31")
@@ -1489,6 +1494,175 @@ async def generate_monthly_contributions(chama_id: str, current_user: dict = Dep
         }
 
     return {"message": "No contributions to generate", "count": 0}
+
+@api_router.get("/contributions/preview-monthly/{chama_id}")
+async def preview_monthly_contributions(chama_id: str, current_user: dict = Depends(get_current_user)):
+    """Preview what will be generated without actually creating contributions"""
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can preview contributions")
+
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    if not chama:
+        raise HTTPException(status_code=404, detail="Chama not found")
+
+    if not chama.get("auto_contribution_enabled", False):
+        raise HTTPException(status_code=400, detail="Auto-contribution is not enabled for this Chama")
+
+    contribution_amount = chama.get("contribution_amount", 0)
+    contribution_day = chama.get("contribution_deadline", 1)
+
+    if contribution_amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid contribution amount")
+
+    # Get all active members
+    members = await db.members.find({
+        "chama_id": chama_id,
+        "status": "active"
+    }).to_list(1000)
+
+    # Calculate next month's due date
+    today = datetime.utcnow()
+    next_month = today.month + 1 if today.month < 12 else 1
+    next_year = today.year if today.month < 12 else today.year + 1
+
+    import calendar
+    max_day = calendar.monthrange(next_year, next_month)[1]
+    safe_day = min(contribution_day, max_day)
+
+    due_date = datetime(next_year, next_month, safe_day).isoformat().split('T')[0]
+
+    # Check if contributions already exist
+    existing_contributions = await db.contributions.find({
+        "chama_id": chama_id,
+        "due_date": due_date,
+        "is_historical": {"$ne": True}
+    }).to_list(10)
+
+    if existing_contributions and len(existing_contributions) > 0:
+        return {
+            "already_exists": True,
+            "message": "Contributions for this period already exist",
+            "due_date": due_date,
+            "preview": []
+        }
+
+    fine_amount = chama.get("fine_amount", 0.0)
+
+    # Build preview for each member
+    preview_list = []
+    total_regular = 0
+    total_arrears = 0
+
+    for m in members:
+        member_id = str(m["_id"])
+
+        # Get user details
+        user = await db.users.find_one({"_id": ObjectId(m["user_id"])})
+        member_name = user["name"] if user else "Unknown"
+
+        # Check for unpaid contributions
+        unpaid_contributions = await db.contributions.find({
+            "chama_id": chama_id,
+            "member_id": member_id,
+            "status": {"$in": ["pending", "pending_verification"]},
+            "due_date": {"$lt": due_date},
+            "consolidated_into_arrears": {"$ne": True}
+        }).to_list(1000)
+
+        if unpaid_contributions and len(unpaid_contributions) > 0:
+            total_unpaid = sum(c["amount"] for c in unpaid_contributions)
+            total_amount = total_unpaid + contribution_amount + fine_amount
+
+            preview_list.append({
+                "member_id": member_id,
+                "member_name": member_name,
+                "has_arrears": True,
+                "amount": total_amount,
+                "breakdown": {
+                    "previous_unpaid": total_unpaid,
+                    "current_contribution": contribution_amount,
+                    "fine": fine_amount,
+                    "total": total_amount,
+                    "unpaid_count": len(unpaid_contributions)
+                }
+            })
+            total_arrears += 1
+        else:
+            preview_list.append({
+                "member_id": member_id,
+                "member_name": member_name,
+                "has_arrears": False,
+                "amount": contribution_amount,
+                "breakdown": {
+                    "current_contribution": contribution_amount,
+                    "total": contribution_amount
+                }
+            })
+            total_regular += 1
+
+    return {
+        "already_exists": False,
+        "due_date": due_date,
+        "total_members": len(members),
+        "regular_contributions": total_regular,
+        "arrears_contributions": total_arrears,
+        "base_amount": contribution_amount,
+        "fine_amount": fine_amount,
+        "preview": preview_list
+    }
+
+@api_router.get("/chamas/{chama_id}/auto-contribution-status")
+async def get_auto_contribution_status(chama_id: str, current_user: dict = Depends(get_current_user)):
+    """Get detailed status and history of auto-contribution generation"""
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": chama_id,
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view auto-contribution status")
+
+    chama = await db.chamas.find_one({"_id": ObjectId(chama_id)})
+    if not chama:
+        raise HTTPException(status_code=404, detail="Chama not found")
+
+    # Get last 10 auto-generation audit logs
+    recent_generations = await db.audit_logs.find({
+        "chama_id": chama_id,
+        "action": {"$in": ["auto_generate_contributions", "generate_monthly_contributions"]}
+    }).sort("timestamp", -1).limit(10).to_list(10)
+
+    generation_history = []
+    for log in recent_generations:
+        generation_history.append({
+            "timestamp": log["timestamp"],
+            "action": log["action"],
+            "details": log["details"],
+            "user_id": log.get("user_id", "system")
+        })
+
+    # Count total auto-generated contributions
+    total_auto_generated = await db.contributions.count_documents({
+        "chama_id": chama_id,
+        "auto_generated": True
+    })
+
+    return {
+        "enabled": chama.get("auto_contribution_enabled", False),
+        "contribution_day": chama.get("contribution_deadline", 1),
+        "contribution_amount": chama.get("contribution_amount", 0),
+        "fine_amount": chama.get("fine_amount", 0.0),
+        "last_run": chama.get("last_auto_contribution_run"),
+        "total_auto_generated": total_auto_generated,
+        "recent_generations": generation_history
+    }
 
 # Loan Endpoints
 @api_router.post("/loans/request")
