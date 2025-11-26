@@ -3077,6 +3077,63 @@ async def update_merry_go_round_status(
 
     return {"message": "Merry-Go-Round status updated successfully"}
 
+@api_router.delete("/merry-go-round/{round_id}")
+async def delete_merry_go_round(round_id: str, current_user: dict = Depends(get_current_user)):
+    mgr = await db.merry_go_rounds.find_one({"_id": ObjectId(round_id)})
+    if not mgr:
+        raise HTTPException(status_code=404, detail="Merry-Go-Round not found")
+
+    # Verify admin
+    member = await db.members.find_one({
+        "chama_id": mgr["chama_id"],
+        "user_id": str(current_user["_id"]),
+        "status": "active"
+    })
+    if not member or member["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can delete merry-go-rounds")
+
+    # Store round details for audit log before deletion
+    round_name = mgr["name"]
+    round_chama_id = mgr["chama_id"]
+    total_members = len(mgr["member_order"])
+    current_position = mgr.get("current_position", 0)
+    funding_source = mgr.get("funding_source", "contribution")
+
+    # Delete associated disbursement records if any
+    if funding_source == "balance":
+        disbursement_result = await db.merry_go_round_disbursements.delete_many({"round_id": round_id})
+        logger.info(f"Deleted {disbursement_result.deleted_count} disbursement records for round {round_id}")
+
+    # Delete the merry-go-round
+    await db.merry_go_rounds.delete_one({"_id": ObjectId(round_id)})
+
+    # Create audit log
+    await db.audit_logs.insert_one({
+        "chama_id": round_chama_id,
+        "user_id": str(current_user["_id"]),
+        "action": "delete_merry_go_round",
+        "details": f"Deleted Merry-Go-Round: {round_name} (Position {current_position}/{total_members}, {funding_source} funded)",
+        "timestamp": datetime.utcnow().isoformat(),
+        "metadata": {
+            "round_id": round_id,
+            "round_name": round_name,
+            "total_members": total_members,
+            "current_position": current_position,
+            "funding_source": funding_source
+        }
+    })
+
+    logger.info(f"Admin {current_user['name']} deleted Merry-Go-Round {round_name} (ID: {round_id})")
+
+    return {
+        "message": "Merry-Go-Round deleted successfully",
+        "details": {
+            "round_name": round_name,
+            "total_members": total_members,
+            "current_position": current_position
+        }
+    }
+
 # Investment Goals Endpoints
 @api_router.post("/investment-goals/create")
 async def create_investment_goal(data: InvestmentGoalCreate, current_user: dict = Depends(get_current_user)):
