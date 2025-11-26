@@ -47,6 +47,11 @@ ALGORITHM = "HS256"
 security = HTTPBearer()
 
 app = FastAPI(title="ChamaKe API", version="1.0.0")
+
+# Add GZIP compression for Render free tier
+from starlette.middleware.gzip import GZIPMiddleware
+app.add_middleware(GZIPMiddleware, minimum_size=500)
+
 api_router = APIRouter(prefix="/api")
 
 # Logging
@@ -609,11 +614,11 @@ async def join_chama(data: ChamaJoin, current_user: dict = Depends(get_current_u
 
 @api_router.get("/chamas/my-chamas")
 async def get_my_chamas(current_user: dict = Depends(get_current_user)):
-    # Find all chamas where user is a member
+    # Find all chamas where user is a member (limit to prevent huge responses)
     members = await db.members.find({
         "user_id": str(current_user["_id"]),
         "status": "active"
-    }).to_list(100)
+    }).limit(50).to_list(50)
     
     chamas = []
     for member in members:
@@ -675,18 +680,21 @@ async def get_chama_members(chama_id: str, current_user: dict = Depends(get_curr
     if not member:
         raise HTTPException(status_code=403, detail="Not a member of this Chama")
     
-    members = await db.members.find({"chama_id": chama_id, "status": "active"}).to_list(1000)
-    
+    members = await db.members.find({"chama_id": chama_id, "status": "active"}).limit(200).to_list(200)
+
     result = []
     for m in members:
-        user = await db.users.find_one({"_id": ObjectId(m["user_id"])})
+        # Use field projection to only get needed fields
+        user = await db.users.find_one(
+            {"_id": ObjectId(m["user_id"])},
+            {"name": 1, "phone": 1}  # Exclude profile_picture to reduce size
+        )
         if user:
             result.append({
                 "member_id": str(m["_id"]),
                 "user_id": str(user["_id"]),
                 "name": user["name"],
                 "phone": user["phone"],
-                "profile_picture": user.get("profile_picture"),
                 "role": m["role"],
                 "joined_at": m["joined_at"]
             })
@@ -793,15 +801,24 @@ async def get_contributions(chama_id: str, current_user: dict = Depends(get_curr
     if not member:
         raise HTTPException(status_code=403, detail="Not a member of this Chama")
     
-    contributions = await db.contributions.find({"chama_id": chama_id}).to_list(1000)
-    
+    # Limit contributions to prevent huge responses
+    contributions = await db.contributions.find(
+        {"chama_id": chama_id}
+    ).sort("due_date", -1).limit(500).to_list(500)
+
     result = []
     for c in contributions:
         # Get member details - member_id is actually the member document _id
-        member_doc = await db.members.find_one({"_id": ObjectId(c["member_id"])})
+        member_doc = await db.members.find_one(
+            {"_id": ObjectId(c["member_id"])},
+            {"user_id": 1}
+        )
         member_name = "Unknown"
         if member_doc:
-            user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+            user = await db.users.find_one(
+                {"_id": ObjectId(member_doc["user_id"])},
+                {"name": 1}
+            )
             member_name = user["name"] if user else "Unknown"
 
         result.append({
@@ -1007,11 +1024,11 @@ async def get_my_contributions(chama_id: str, current_user: dict = Depends(get_c
     if not member:
         raise HTTPException(status_code=403, detail="Not a member of this Chama")
 
-    # Get contributions for this member
+    # Get contributions for this member (limit to reduce response size)
     contributions = await db.contributions.find({
         "chama_id": chama_id,
         "member_id": str(member["_id"])
-    }).to_list(1000)
+    }).sort("due_date", -1).limit(200).to_list(200)
 
     result = []
     for c in contributions:
@@ -1023,17 +1040,20 @@ async def get_my_contributions(chama_id: str, current_user: dict = Depends(get_c
             "paid_date": c.get("paid_date"),
             "payment_method": None,
             "transaction_reference": None,
-            "receipt_image": None
+            "has_receipt": False  # Changed from receipt_image to boolean
         }
 
-        # Get payment details if exists
+        # Get payment details if exists (exclude receipt_image for list view)
         if c.get("payment_id"):
-            payment = await db.payments.find_one({"_id": ObjectId(c["payment_id"])})
+            payment = await db.payments.find_one(
+                {"_id": ObjectId(c["payment_id"])},
+                {"payment_method": 1, "transaction_reference": 1, "verified": 1, "admin_notes": 1, "receipt_image": 1}
+            )
             if payment:
                 contribution_data.update({
                     "payment_method": payment.get("payment_method"),
                     "transaction_reference": payment.get("transaction_reference"),
-                    "receipt_image": payment.get("receipt_image"),
+                    "has_receipt": bool(payment.get("receipt_image")),  # Only indicate presence
                     "verified": payment.get("verified", False),
                     "admin_notes": payment.get("admin_notes")
                 })
@@ -1104,19 +1124,25 @@ async def get_pending_payments(chama_id: str, current_user: dict = Depends(get_c
     if not member or member["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admins can view pending payments")
 
-    # Get pending payments
+    # Get pending payments (limit and exclude base64)
     payments = await db.payments.find({
         "chama_id": chama_id,
         "status": "pending_verification"
-    }).to_list(1000)
+    }).sort("created_at", -1).limit(100).to_list(100)
 
     result = []
     for p in payments:
         # Get member details
-        member_doc = await db.members.find_one({"_id": ObjectId(p["member_id"])})
+        member_doc = await db.members.find_one(
+            {"_id": ObjectId(p["member_id"])},
+            {"user_id": 1}
+        )
         member_name = "Unknown"
         if member_doc:
-            user = await db.users.find_one({"_id": ObjectId(member_doc["user_id"])})
+            user = await db.users.find_one(
+                {"_id": ObjectId(member_doc["user_id"])},
+                {"name": 1}
+            )
             member_name = user["name"] if user else "Unknown"
 
         result.append({
@@ -1126,7 +1152,7 @@ async def get_pending_payments(chama_id: str, current_user: dict = Depends(get_c
             "amount": p["amount"],
             "payment_method": p["payment_method"],
             "transaction_reference": p.get("transaction_reference"),
-            "receipt_image": p.get("receipt_image"),
+            "has_receipt": bool(p.get("receipt_image")),  # Don't send base64 in list
             "notes": p.get("notes"),
             "created_at": p["created_at"]
         })
@@ -1387,81 +1413,51 @@ async def generate_monthly_contributions(chama_id: str, current_user: dict = Dep
     # Get fine amount
     fine_amount = chama.get("fine_amount", 0.0)
 
-    # Create contributions for all members with arrears tracking
+    # Create contributions for all members (one contribution per month - base amount only)
     contributions_to_insert = []
-    arrears_created = 0
+    members_with_penalties = 0
 
     for m in members:
         member_id = str(m["_id"])
 
-        # Check for unpaid contributions for this member (exclude consolidated)
+        # Check for unpaid contributions for this member
         unpaid_contributions = await db.contributions.find({
             "chama_id": chama_id,
             "member_id": member_id,
             "status": {"$in": ["pending", "pending_verification"]},
             "due_date": {"$lt": due_date},  # Only past contributions
-            "consolidated_into_arrears": {"$ne": True}  # Exclude already consolidated
         }).to_list(1000)
 
-        if unpaid_contributions and len(unpaid_contributions) > 0:
-            # Member has unpaid contributions - create arrears record
+        has_unpaid = unpaid_contributions and len(unpaid_contributions) > 0
+
+        # Current month contribution - always just the base amount (no consolidation)
+        contribution_dict = {
+            "chama_id": chama_id,
+            "member_id": member_id,
+            "amount": contribution_amount,
+            "due_date": due_date,
+            "status": "pending",
+            "paid_date": None,
+            "is_historical": False,
+            "auto_generated": True,
+            "created_at": datetime.utcnow().isoformat()
+        }
+
+        # Add penalty information if member has unpaid contributions (penalty tracked separately)
+        if has_unpaid and fine_amount > 0:
             total_unpaid = sum(c["amount"] for c in unpaid_contributions)
-
-            # Build arrears breakdown
-            arrears_breakdown = {
-                "previous_unpaid": total_unpaid,
-                "current_month_contribution": contribution_amount,
-                "fine": fine_amount,
-                "total_arrears": total_unpaid + contribution_amount + fine_amount,
-                "unpaid_periods": [
-                    {
-                        "contribution_id": str(c["_id"]),
-                        "due_date": c["due_date"],
-                        "amount": c["amount"]
-                    }
-                    for c in unpaid_contributions
-                ]
+            contribution_dict["penalty_info"] = {
+                "has_penalty": True,
+                "penalty_amount": fine_amount,
+                "reason": "Late payment penalty for unpaid contributions",
+                "unpaid_count": len(unpaid_contributions),
+                "total_unpaid_balance": total_unpaid
             }
-
-            contribution_dict = {
-                "chama_id": chama_id,
-                "member_id": member_id,
-                "amount": total_unpaid + contribution_amount + fine_amount,
-                "due_date": due_date,
-                "status": "pending",
-                "paid_date": None,
-                "is_historical": False,
-                "auto_generated": True,
-                "is_arrears": True,
-                "arrears_breakdown": arrears_breakdown,
-                "created_at": datetime.utcnow().isoformat()
-            }
-            arrears_created += 1
-
-            # Mark old unpaid contributions as consolidated to prevent double-counting
-            unpaid_contribution_ids = [c["_id"] for c in unpaid_contributions]
-            if unpaid_contribution_ids:
-                await db.contributions.update_many(
-                    {"_id": {"$in": unpaid_contribution_ids}},
-                    {"$set": {
-                        "consolidated_into_arrears": True,
-                        "consolidated_date": datetime.utcnow().isoformat(),
-                        "arrears_contribution_due_date": due_date
-                    }}
-                )
+            members_with_penalties += 1
         else:
-            # No unpaid contributions - create normal contribution
-            contribution_dict = {
-                "chama_id": chama_id,
-                "member_id": member_id,
-                "amount": contribution_amount,
-                "due_date": due_date,
-                "status": "pending",
-                "paid_date": None,
-                "is_historical": False,
-                "auto_generated": True,
-                "is_arrears": False,
-                "created_at": datetime.utcnow().isoformat()
+            contribution_dict["penalty_info"] = {
+                "has_penalty": False,
+                "penalty_amount": 0
             }
 
         contributions_to_insert.append(contribution_dict)
@@ -1481,16 +1477,17 @@ async def generate_monthly_contributions(chama_id: str, current_user: dict = Dep
             "chama_id": chama_id,
             "user_id": str(current_user["_id"]),
             "action": "generate_monthly_contributions",
-            "details": f"Generated {inserted_count} contributions for {due_date} ({arrears_created} with arrears)",
+            "details": f"Generated {inserted_count} contributions for {due_date} ({members_with_penalties} with penalties)",
             "timestamp": datetime.utcnow().isoformat()
         })
 
         return {
             "message": f"Successfully generated {inserted_count} monthly contributions",
             "count": inserted_count,
-            "arrears_count": arrears_created,
+            "members_with_penalties": members_with_penalties,
             "due_date": due_date,
-            "amount": contribution_amount
+            "amount": contribution_amount,
+            "penalty_amount": fine_amount
         }
 
     return {"message": "No contributions to generate", "count": 0}
@@ -1557,7 +1554,7 @@ async def preview_monthly_contributions(chama_id: str, current_user: dict = Depe
     # Build preview for each member
     preview_list = []
     total_regular = 0
-    total_arrears = 0
+    total_with_penalties = 0
 
     for m in members:
         member_id = str(m["_id"])
@@ -1572,27 +1569,27 @@ async def preview_monthly_contributions(chama_id: str, current_user: dict = Depe
             "member_id": member_id,
             "status": {"$in": ["pending", "pending_verification"]},
             "due_date": {"$lt": due_date},
-            "consolidated_into_arrears": {"$ne": True}
         }).to_list(1000)
 
-        if unpaid_contributions and len(unpaid_contributions) > 0:
+        has_unpaid = unpaid_contributions and len(unpaid_contributions) > 0
+
+        if has_unpaid and fine_amount > 0:
             total_unpaid = sum(c["amount"] for c in unpaid_contributions)
-            total_amount = total_unpaid + contribution_amount + fine_amount
 
             preview_list.append({
                 "member_id": member_id,
                 "member_name": member_name,
                 "has_arrears": True,
-                "amount": total_amount,
+                "amount": contribution_amount,
                 "breakdown": {
-                    "previous_unpaid": total_unpaid,
-                    "current_contribution": contribution_amount,
-                    "fine": fine_amount,
-                    "total": total_amount,
-                    "unpaid_count": len(unpaid_contributions)
+                    "current_month_only": contribution_amount,
+                    "penalty_for_late_payments": fine_amount,
+                    "existing_unpaid_balance": total_unpaid,
+                    "unpaid_count": len(unpaid_contributions),
+                    "note": "Previous unpaid contributions remain separate"
                 }
             })
-            total_arrears += 1
+            total_with_penalties += 1
         else:
             preview_list.append({
                 "member_id": member_id,
@@ -1601,7 +1598,7 @@ async def preview_monthly_contributions(chama_id: str, current_user: dict = Depe
                 "amount": contribution_amount,
                 "breakdown": {
                     "current_contribution": contribution_amount,
-                    "total": contribution_amount
+                    "penalty": 0
                 }
             })
             total_regular += 1
@@ -1611,7 +1608,7 @@ async def preview_monthly_contributions(chama_id: str, current_user: dict = Depe
         "due_date": due_date,
         "total_members": len(members),
         "regular_contributions": total_regular,
-        "arrears_contributions": total_arrears,
+        "arrears_contributions": total_with_penalties,
         "base_amount": contribution_amount,
         "fine_amount": fine_amount,
         "preview": preview_list
@@ -1751,7 +1748,7 @@ async def get_loans(chama_id: str, current_user: dict = Depends(get_current_user
     if not member:
         raise HTTPException(status_code=403, detail="Not a member of this Chama")
     
-    loans = await db.loans.find({"chama_id": chama_id}).to_list(1000)
+    loans = await db.loans.find({"chama_id": chama_id}).sort("created_at", -1).limit(200).to_list(200)
     
     result = []
     for loan in loans:
@@ -2204,11 +2201,33 @@ async def get_reports_analytics(
     if date_filter:
         contribution_filter.update(date_filter)
 
-    contributions = await db.contributions.find(contribution_filter).to_list(10000)
+    # Use aggregation instead of loading all documents
+    contribution_pipeline = [
+        {"$match": contribution_filter},
+        {"$group": {
+            "_id": "$status",
+            "total": {"$sum": "$amount"},
+            "count": {"$sum": 1}
+        }}
+    ]
+    contribution_stats = await db.contributions.aggregate(contribution_pipeline).to_list(10)
+    contributions = []  # Don't load all contributions
 
-    # For loans, we don't filter by date range for now (use approved_date if needed)
-    loans = await db.loans.find({"chama_id": chama_id}).to_list(10000)
-    members_list = await db.members.find({"chama_id": chama_id, "status": "active"}).to_list(10000)
+    # For loans, use aggregation
+    loan_pipeline = [
+        {"$match": {"chama_id": chama_id}},
+        {"$group": {
+            "_id": "$status",
+            "total": {"$sum": "$amount"},
+            "count": {"$sum": 1}
+        }}
+    ]
+    loan_stats = await db.loans.aggregate(loan_pipeline).to_list(10)
+    loans = []  # Don't load all loans
+
+    # Get member count only
+    member_count = await db.members.count_documents({"chama_id": chama_id, "status": "active"})
+    members_list = []  # Don't load all members
 
     # Calculate key metrics
     total_contributions = sum(c["amount"] for c in contributions if c["status"] == "paid")
@@ -5743,81 +5762,51 @@ async def auto_generate_contributions_task():
                         # Get fine amount
                         fine_amount = chama.get("fine_amount", 0.0)
 
-                        # Create contributions for all members with arrears tracking
+                        # Create contributions for all members (base amount only)
                         contributions_to_insert = []
-                        arrears_created = 0
+                        members_with_penalties = 0
 
                         for m in members:
                             member_id = str(m["_id"])
 
-                            # Check for unpaid contributions for this member (exclude consolidated)
+                            # Check for unpaid contributions for this member
                             unpaid_contributions = await db.contributions.find({
                                 "chama_id": chama_id,
                                 "member_id": member_id,
                                 "status": {"$in": ["pending", "pending_verification"]},
                                 "due_date": {"$lt": due_date},  # Only past contributions
-                                "consolidated_into_arrears": {"$ne": True}  # Exclude already consolidated
                             }).to_list(1000)
 
-                            if unpaid_contributions and len(unpaid_contributions) > 0:
-                                # Member has unpaid contributions - create arrears record
+                            has_unpaid = unpaid_contributions and len(unpaid_contributions) > 0
+
+                            # Current month contribution - always just the base amount (no consolidation)
+                            contribution_dict = {
+                                "chama_id": chama_id,
+                                "member_id": member_id,
+                                "amount": contribution_amount,
+                                "due_date": due_date,
+                                "status": "pending",
+                                "paid_date": None,
+                                "is_historical": False,
+                                "auto_generated": True,
+                                "created_at": datetime.utcnow().isoformat()
+                            }
+
+                            # Add penalty information if member has unpaid contributions (penalty tracked separately)
+                            if has_unpaid and fine_amount > 0:
                                 total_unpaid = sum(c["amount"] for c in unpaid_contributions)
-
-                                # Build arrears breakdown
-                                arrears_breakdown = {
-                                    "previous_unpaid": total_unpaid,
-                                    "current_month_contribution": contribution_amount,
-                                    "fine": fine_amount,
-                                    "total_arrears": total_unpaid + contribution_amount + fine_amount,
-                                    "unpaid_periods": [
-                                        {
-                                            "contribution_id": str(c["_id"]),
-                                            "due_date": c["due_date"],
-                                            "amount": c["amount"]
-                                        }
-                                        for c in unpaid_contributions
-                                    ]
+                                contribution_dict["penalty_info"] = {
+                                    "has_penalty": True,
+                                    "penalty_amount": fine_amount,
+                                    "reason": "Late payment penalty for unpaid contributions",
+                                    "unpaid_count": len(unpaid_contributions),
+                                    "total_unpaid_balance": total_unpaid
                                 }
-
-                                contribution_dict = {
-                                    "chama_id": chama_id,
-                                    "member_id": member_id,
-                                    "amount": total_unpaid + contribution_amount + fine_amount,
-                                    "due_date": due_date,
-                                    "status": "pending",
-                                    "paid_date": None,
-                                    "is_historical": False,
-                                    "auto_generated": True,
-                                    "is_arrears": True,
-                                    "arrears_breakdown": arrears_breakdown,
-                                    "created_at": datetime.utcnow().isoformat()
-                                }
-                                arrears_created += 1
-
-                                # Mark old unpaid contributions as consolidated to prevent double-counting
-                                unpaid_contribution_ids = [c["_id"] for c in unpaid_contributions]
-                                if unpaid_contribution_ids:
-                                    await db.contributions.update_many(
-                                        {"_id": {"$in": unpaid_contribution_ids}},
-                                        {"$set": {
-                                            "consolidated_into_arrears": True,
-                                            "consolidated_date": datetime.utcnow().isoformat(),
-                                            "arrears_contribution_due_date": due_date
-                                        }}
-                                    )
+                                members_with_penalties += 1
                             else:
-                                # No unpaid contributions - create normal contribution
-                                contribution_dict = {
-                                    "chama_id": chama_id,
-                                    "member_id": member_id,
-                                    "amount": contribution_amount,
-                                    "due_date": due_date,
-                                    "status": "pending",
-                                    "paid_date": None,
-                                    "is_historical": False,
-                                    "auto_generated": True,
-                                    "is_arrears": False,
-                                    "created_at": datetime.utcnow().isoformat()
+                                contribution_dict["penalty_info"] = {
+                                    "has_penalty": False,
+                                    "penalty_amount": 0
                                 }
 
                             contributions_to_insert.append(contribution_dict)
@@ -5837,11 +5826,11 @@ async def auto_generate_contributions_task():
                                 "chama_id": chama_id,
                                 "user_id": "system",
                                 "action": "auto_generate_contributions",
-                                "details": f"Auto-generated {inserted_count} contributions for {due_date} ({arrears_created} with arrears)",
+                                "details": f"Auto-generated {inserted_count} contributions for {due_date} ({members_with_penalties} with penalties)",
                                 "timestamp": datetime.utcnow().isoformat()
                             })
 
-                            logger.info(f"Generated {inserted_count} contributions for chama {chama_id} (due: {due_date}, {arrears_created} with arrears)")
+                            logger.info(f"Generated {inserted_count} contributions for chama {chama_id} (due: {due_date}, {members_with_penalties} with penalties)")
 
                 except Exception as e:
                     logger.error(f"Error processing chama {chama.get('_id')}: {str(e)}", exc_info=True)
@@ -5912,79 +5901,49 @@ async def auto_generate_contributions_once():
                 fine_amount = chama.get("fine_amount", 0.0)
 
                 contributions_to_insert = []
-                arrears_created = 0
+                members_with_penalties = 0
 
                 for m in members:
                     member_id = str(m["_id"])
 
-                    # Check for unpaid contributions for this member (exclude consolidated)
+                    # Check for unpaid contributions for this member
                     unpaid_contributions = await db.contributions.find({
                         "chama_id": chama_id,
                         "member_id": member_id,
                         "status": {"$in": ["pending", "pending_verification"]},
                         "due_date": {"$lt": due_date},  # Only past contributions
-                        "consolidated_into_arrears": {"$ne": True}  # Exclude already consolidated
                     }).to_list(1000)
 
-                    if unpaid_contributions and len(unpaid_contributions) > 0:
-                        # Member has unpaid contributions - create arrears record
+                    has_unpaid = unpaid_contributions and len(unpaid_contributions) > 0
+
+                    # Current month contribution - always just the base amount (no consolidation)
+                    contribution_dict = {
+                        "chama_id": chama_id,
+                        "member_id": member_id,
+                        "amount": contribution_amount,
+                        "due_date": due_date,
+                        "status": "pending",
+                        "paid_date": None,
+                        "is_historical": False,
+                        "auto_generated": True,
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+
+                    # Add penalty information if member has unpaid contributions (penalty tracked separately)
+                    if has_unpaid and fine_amount > 0:
                         total_unpaid = sum(c["amount"] for c in unpaid_contributions)
-
-                        # Build arrears breakdown
-                        arrears_breakdown = {
-                            "previous_unpaid": total_unpaid,
-                            "current_month_contribution": contribution_amount,
-                            "fine": fine_amount,
-                            "total_arrears": total_unpaid + contribution_amount + fine_amount,
-                            "unpaid_periods": [
-                                {
-                                    "contribution_id": str(c["_id"]),
-                                    "due_date": c["due_date"],
-                                    "amount": c["amount"]
-                                }
-                                for c in unpaid_contributions
-                            ]
+                        contribution_dict["penalty_info"] = {
+                            "has_penalty": True,
+                            "penalty_amount": fine_amount,
+                            "reason": "Late payment penalty for unpaid contributions",
+                            "unpaid_count": len(unpaid_contributions),
+                            "total_unpaid_balance": total_unpaid
                         }
-
-                        contribution_dict = {
-                            "chama_id": chama_id,
-                            "member_id": member_id,
-                            "amount": total_unpaid + contribution_amount + fine_amount,
-                            "due_date": due_date,
-                            "status": "pending",
-                            "paid_date": None,
-                            "is_historical": False,
-                            "auto_generated": True,
-                            "is_arrears": True,
-                            "arrears_breakdown": arrears_breakdown,
-                            "created_at": datetime.utcnow().isoformat()
-                        }
-                        arrears_created += 1
-
-                        # Mark old unpaid contributions as consolidated to prevent double-counting
-                        unpaid_contribution_ids = [c["_id"] for c in unpaid_contributions]
-                        if unpaid_contribution_ids:
-                            await db.contributions.update_many(
-                                {"_id": {"$in": unpaid_contribution_ids}},
-                                {"$set": {
-                                    "consolidated_into_arrears": True,
-                                    "consolidated_date": datetime.utcnow().isoformat(),
-                                    "arrears_contribution_due_date": due_date
-                                }}
-                            )
+                        members_with_penalties += 1
                     else:
-                        # No unpaid contributions - create normal contribution
-                        contribution_dict = {
-                            "chama_id": chama_id,
-                            "member_id": member_id,
-                            "amount": contribution_amount,
-                            "due_date": due_date,
-                            "status": "pending",
-                            "paid_date": None,
-                            "is_historical": False,
-                            "auto_generated": True,
-                            "is_arrears": False,
-                            "created_at": datetime.utcnow().isoformat()
+                        contribution_dict["penalty_info"] = {
+                            "has_penalty": False,
+                            "penalty_amount": 0
                         }
 
                     contributions_to_insert.append(contribution_dict)
@@ -6003,7 +5962,7 @@ async def auto_generate_contributions_once():
                         "chama_id": chama_id,
                         "user_id": "system",
                         "action": "auto_generate_contributions",
-                        "details": f"Auto-generated {inserted_count} contributions for {due_date} ({arrears_created} with arrears)",
+                        "details": f"Auto-generated {inserted_count} contributions for {due_date} ({members_with_penalties} with penalties)",
                         "timestamp": datetime.utcnow().isoformat()
                     })
 
